@@ -45,14 +45,8 @@ Decoding only requires:
 ```bash
 git clone https://github.com/shevisj/subtext
 cd subtext
-pip install -r requirements.txt
-```
-
-Requirements (typical):
-
-```text
-torch
-transformers
+uv venv .env --python 3.13
+uv pip install -r requirements.txt
 ```
 
 ---
