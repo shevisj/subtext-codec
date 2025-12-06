@@ -43,7 +43,7 @@ Decoding only requires:
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/subtext
+git clone https://github.com/shevisj/subtext
 cd subtext
 pip install -r requirements.txt
 ```
