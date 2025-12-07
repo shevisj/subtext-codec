@@ -19,7 +19,8 @@ dependencies = [
 test = ["pytest>=9.0"]
 
 [project.scripts]
-subtext = "subtext.cli:main"
+subtext-codec = "subtext_codec.cli:main"
+subtext = "subtext_codec.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/shevisj/subtext"
@@ -27,4 +28,4 @@ Repository = "https://github.com/shevisj/subtext"
 Issues = "https://github.com/shevisj/subtext/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["subtext"]
+packages = ["subtext_codec"]

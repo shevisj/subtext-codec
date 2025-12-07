@@ -6,7 +6,7 @@ GPU: NVIDIA RTX 5090
 RAM: 128 GB
 
 ## Project summary
-- Repository: subtext — PoC codec that hides binary data inside LLM-generated text by steering token selection via logit rank.
+- Repository: subtext-codec — PoC codec that hides binary data inside LLM-generated text by steering token selection via logit rank.
 -- Core script: `__main__.py` (Python, torch + transformers). Provides `encode`/`decode` CLI with deterministic replay.
 - Metadata header format: `[LLM-CODEC v1; base=<B>; length=<bytes>; top_k=<value|none>]` followed by the generated body (which must include the provided prompt prefix).
 

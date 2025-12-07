@@ -1,6 +1,4 @@
-Here’s a concrete build spec you can hand to an AI agent (or a human) to implement the PoC.
-
----
+# High-Level Overview
 
 ## 0. Goal
 
@@ -116,13 +114,11 @@ Procedure:
        digits.append(rem)
    digits.reverse()
    ```
-4. To make decoding simpler, **store the original byte length** separately and include it in the encoded text metadata (see §4.3).
-
 ### 4.2 Base-B digit string → bytes
 
 ```python
-def base_digits_to_bytes(digits: list[int], base: int, length_bytes: int) -> bytes:
-    """Inverse of bytes_to_base_digits given the original length."""
+def base_digits_to_bytes(digits: list[int], base: int) -> bytes:
+    """Inverse of bytes_to_base_digits returning the minimal big-endian form."""
 ```
 
 1. Compute integer:
@@ -132,18 +128,19 @@ def base_digits_to_bytes(digits: list[int], base: int, length_bytes: int) -> byt
    for d in digits:
        n = n * base + d
    ```
-2. Convert back to bytes with the known length:
+2. Convert back to bytes using the minimal number of bytes needed to represent `n` (return `b""` for the zero case).
 
    ```python
+   length_bytes = max(1, (n.bit_length() + 7) // 8)
    data = n.to_bytes(length_bytes, byteorder="big", signed=False)
+   if n == 0 and len(digits) == 0:
+       data = b""
    ```
-3. If `len(data) > length_bytes`, truncate from the left; if less, pad with leading zeros (this should not happen if encoding/decoding is consistent but guard anyway).
 
 ### 4.3 Metadata encoding
 
 We need to carry **metadata** through in the text so decoding knows:
 
-* Original byte length (`length_bytes`).
 * Base (`B`).
 * Optional: a small version marker.
 
@@ -152,7 +149,7 @@ For this PoC, keep it simple:
 * Prepend a short **header line** before the natural-language body, for example:
 
   ```
-  [LLM-CODEC v1; base=16; length=1234]
+  [LLM-CODEC v1; base=16]
   <generated text continues here...>
   ```
 
@@ -307,10 +304,10 @@ def decode_text_to_data(
    * Use a regex like:
 
      ```text
-     ^\[LLM-CODEC v1; base=(\d+); length=(\d+)\]\s*(.*)$
+     ^\[LLM-CODEC v1; base=(\d+)\]\s*(.*)$
      ```
 
-     capturing `base`, `length_bytes`, and `body_text`.
+     capturing `base` and `body_text`.
 
 2. **Reconstruct prompt vs generated text**
 
@@ -383,11 +380,11 @@ def decode_text_to_data(
 
    * Append `next_token_id` to `input_ids` and continue.
 
-   * Optional early stop: Once we have enough digits to reconstruct `length_bytes` and possibly some known max bit length, we can stop. For PoC, easiest is to **consume all generated tokens**, then reconstruct.
+   * Optional early stop: If a max output size is known ahead of time, stop once enough digits are gathered; for the PoC, consume all generated tokens and let the terminator end the loop.
 
 5. **Convert digits back to bytes**
 
-   * Use `base_digits_to_bytes(digits, base, length_bytes)`.
+   * Use `base_digits_to_bytes(digits, base)`.
 
 6. Return bytes.
 
@@ -488,4 +485,3 @@ The implementation should note (in comments / README):
 * **Floating-point stability**: tiny numeric differences could theoretically change rank order; for this PoC we assume stable ordering across runs on the same hardware and environment.
 * **Context limits**: if data is large, the number of digits may require more tokens than the context window; for now, we assume small payloads and do not implement chunking.
 * **EOS tokens**: we don’t special-case them beyond what’s described; in practice, might want to avoid them for “cleaner” prose.
-

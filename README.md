@@ -1,7 +1,7 @@
-# subtext  
+# subtext-codec  
 ### Steganographic data encoding in natural language using LLM logit-rank steering
 
-**subtext** is a proof-of-concept codec that hides arbitrary binary data inside seemingly normal LLM-generated text.  
+**subtext-codec** is a proof-of-concept codec that hides arbitrary binary data inside seemingly normal LLM-generated text.  
 It works by steering a language model’s next-token choices using the **rank** of each token in the model’s logit distribution.  
 With the same model, tokenizer, prefix, and parameters, the process is fully reversible — enabling text that reads naturally while secretly encoding bytes.
 
@@ -34,9 +34,10 @@ Decoding only requires:
 - **Configurable base** — trade off naturalness vs. capacity  
 - **Deterministic next-token steering** using logits, no randomness  
 - **Full round-trip encode/decode** for arbitrary byte payloads  
+- **Single-token terminator** — decoder stops at the first token ranked outside the base  
 - **Hugging Face Transformers backend** — works with most causal LMs  
 - **Readable, compact implementation** designed for experimentation  
-- **Metadata header** embedded in output for reliable decoding  
+- **External key file** captures encode-time metadata for reliable decoding  
 
 ---
 
@@ -67,45 +68,74 @@ Tests use `pytest`.
 ## Usage
 The CLI exposes `encode` and `decode` subcommands. Shared flags:
 
-- `--model-name-or-path` – Hugging Face model name or local path (causal LM)
-- `--prompt-prefix` – prefix text used for both encode and decode
-- `--device` – e.g. `cpu` or `cuda`
-- `--top-k` – optional cap on candidate tokens; must satisfy `base <= top_k`
+- `--model-name-or-path` – Hugging Face model name or local path (causal LM); optional on decode if stored in the key file
+- `--prompt-prefix` – prefix text used for both encode and decode (defaults from key if present)
+- `--device` – e.g. `cpu` or `cuda` (falls back to the key value or defaults to `cpu`)
+- `--torch-dtype` – optional weight dtype (`auto`, fp16, bf16, fp32)
 - `--max-context-length` – optional guardrail; defaults to model limit
 - `--seed` – deterministic seeding (default: 0)
 
 ### Encode bytes into text
 
 ```bash
-subtext encode \
+subtext-codec encode \
   --model-name-or-path gpt2 \
   --base 8 \
   --prompt-prefix "Once upon a time, " \
-  --input-bytes secret.bin \
+  --input-bytes secret.txt \
   --output-text message.txt \
+  --key key.json \
   --max-new-tokens 512 \
   --top-k 16
 ```
 
-The output text begins with a metadata header, e.g.:
+The output text is just the generated story (no metadata header). The accompanying `codec.key.json` captures `base`, `top_k`, the prompt prefix used to generate the message, the `device`, and the `torch_dtype`.
+The encoder automatically appends a single terminator token whose rank is the first index outside the chosen base; the decoder stops at that token and ignores any trailing text.
 
+You can also reuse an existing key instead of re-entering parameters:
+
+```bash
+subtext-codec encode \
+  --key codec.key.json \
+  --input-bytes secret.bin \
+  --output-text message.txt \
+  --include-model-in-key
 ```
-[LLM-CODEC v1; base=8; length=42; top_k=16]
-Once upon a time, ...
-```
+
+If the path you pass to `--key` already exists, its values (base, top-k, prompt prefix, device, model name if saved) are reused; any CLI overrides are written back to the same file. If it does not exist, the encoder creates it after generation. The model name you supply is persisted so you can decode without re-specifying it; the legacy `--include-model-in-key` flag remains for compatibility. The key also stores `torch_dtype` so you can replay the same loading setup.
 
 ### Decode text back into bytes
 
 ```bash
-subtext decode \
-  --model-name-or-path gpt2 \
-  --prompt-prefix "Once upon a time, " \
+subtext-codec decode \
   --input-text message.txt \
-  --output-bytes decoded.bin \
-  --top-k 16
+  --key codec.key.json \
+  --output-bytes decoded.bin
 ```
 
-The base, payload length, and `top_k` are pulled from the header; you still need to supply the prompt prefix and model path.
+The base and `top_k` are read from the key file. If the key already stores the model name from encode time you can omit `--model-name-or-path` here. The prompt prefix is taken from the key unless you explicitly pass `--prompt-prefix` (it must still match the encode run).
+Decoding stops as soon as it encounters a generated token whose rank is **outside** the configured base (i.e., rank `>= base`), discarding that terminator and any text after it.
+Any CLI overrides you provide for prompt/device/model during decode are saved back into the key for future reuse.
+Decoded bytes are reconstructed from the digit stream without persisting the original payload length, so leading zero bytes are intentionally stripped.
+
+### Sample artifacts
+
+If you just want to poke at the codec without generating new data, there is a small fixture set under `samples/`:
+
+- `samples/message.txt` — generated text that hides `samples/secret.txt`
+- `samples/codec.key.json` — matching base/top-k/prompt/model metadata
+- `samples/decoded.txt` — expected decode output for comparison
+
+To decode the included example back into bytes:
+
+```bash
+subtext-codec decode \
+  --input-text samples/message.txt \
+  --key samples/codec.key.json \
+  --output-bytes samples/decoded.txt
+```
+
+The key was created with the prompt prefix `"Once upon a time, "` and a Llama 3.1 8B model; decoding requires access to the same model and tokenizer.
 
 ---
 
