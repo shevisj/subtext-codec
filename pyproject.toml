@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "subtext-codec"
+version = "0.1.0"
+description = "Steganographic data encoding in LLM-generated text using logit rank steering."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Shevis Johnson" , email = "shevisjohnson@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "transformers>=4.38",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.0"]
+
+[project.scripts]
+subtext = "subtext.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/shevisj/subtext"
+Repository = "https://github.com/shevisj/subtext"
+Issues = "https://github.com/shevisj/subtext/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["subtext"]

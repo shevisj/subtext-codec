@@ -42,6 +42,15 @@ Decoding only requires:
 
 ## Installation
 
+From PyPI (or via `uv`):
+
+```bash
+uv pip install subtext-codec
+# or: pip install subtext-codec
+```
+
+From source:
+
 ```bash
 git clone https://github.com/shevisj/subtext
 cd subtext
@@ -49,31 +58,54 @@ uv venv .env --python 3.13
 uv pip install -r requirements.txt
 ```
 
+`torch` and `transformers` are the only real runtime dependencies, but to reduce decoding errors all package versions are pinned in `requirements.txt`.
+
+Tests use `pytest`.
+
 ---
 
 ## Usage
+The CLI exposes `encode` and `decode` subcommands. Shared flags:
+
+- `--model-name-or-path` – Hugging Face model name or local path (causal LM)
+- `--prompt-prefix` – prefix text used for both encode and decode
+- `--device` – e.g. `cpu` or `cuda`
+- `--top-k` – optional cap on candidate tokens; must satisfy `base <= top_k`
+- `--max-context-length` – optional guardrail; defaults to model limit
+- `--seed` – deterministic seeding (default: 0)
 
 ### Encode bytes into text
 
 ```bash
-python llm_codec.py encode \
+subtext encode \
   --model-name-or-path gpt2 \
   --base 8 \
   --prompt-prefix "Once upon a time, " \
   --input-bytes secret.bin \
   --output-text message.txt \
-  --max-new-tokens 512
+  --max-new-tokens 512 \
+  --top-k 16
+```
+
+The output text begins with a metadata header, e.g.:
+
+```
+[LLM-CODEC v1; base=8; length=42; top_k=16]
+Once upon a time, ...
 ```
 
 ### Decode text back into bytes
 
 ```bash
-python llm_codec.py decode \
+subtext decode \
   --model-name-or-path gpt2 \
   --prompt-prefix "Once upon a time, " \
   --input-text message.txt \
-  --output-bytes decoded.bin
+  --output-bytes decoded.bin \
+  --top-k 16
 ```
+
+The base, payload length, and `top_k` are pulled from the header; you still need to supply the prompt prefix and model path.
 
 ---
 
@@ -83,8 +115,19 @@ python llm_codec.py decode \
 * **Model-dependent**: requires the exact same weights + tokenizer
 * **Floating-point sensitivity**: extreme ties in logits may reorder ranks
 * **Context length**: large payloads may exceed model context without chunking
+* **Parameter drift**: mismatching base, top-k, or prompt prefix will break decoding
 
 This project is a **research prototype**, not a secure or production steganography system.
+
+---
+
+## Testing
+
+```
+python -m pytest
+```
+
+The slow round-trip test uses `sshleifer/tiny-gpt2`; if the model cannot be downloaded (e.g., offline), the test is skipped.
 
 ---
 

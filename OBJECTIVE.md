@@ -46,7 +46,7 @@ Decoding:
 
 Implement a **single Python CLI script**:
 
-* `llm_codec.py`
+* `__main__.py`
 * Using:
 
   * `transformers` (Hugging Face)
