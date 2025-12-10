@@ -62,8 +62,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     enc = subparsers.add_parser("encode", parents=[common])
-    enc.add_argument("--base", type=int)
     enc.add_argument("--top-k", type=int, default=None)
+    enc.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Cumulative probability threshold for variable bases (0 < top-p <= 1)",
+    )
     enc.add_argument("--input-bytes", required=True)
     enc.add_argument("--output-text", required=True)
     enc.add_argument(
@@ -71,7 +76,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to the codec key (loads existing values and writes updates)",
     )
-    enc.add_argument("--max-new-tokens", type=int, default=512)
     enc.add_argument(
         "--include-model-in-key",
         action="store_true",
@@ -81,6 +85,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dec = subparsers.add_parser("decode", parents=[common])
     dec.add_argument("--input-text", required=True)
     dec.add_argument("--output-bytes", required=True)
+    dec.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Override top-p from the key (0 < top-p <= 1)",
+    )
     dec.add_argument(
         "--key",
         required=True,
@@ -107,19 +117,18 @@ def run_encode(args) -> None:
     if prompt_prefix is None:
         raise ValueError("prompt-prefix is required unless provided via --key")
 
-    base = (
-        args.base
-        if args.base is not None
-        else (key_from_input.base if key_from_input else None)
-    )
-    if base is None:
-        raise ValueError("base is required unless provided via --key")
-
     top_k = (
         args.top_k
         if args.top_k is not None
         else key_from_input.top_k if key_from_input else None
     )
+    top_p = (
+        args.top_p
+        if args.top_p is not None
+        else key_from_input.top_p if key_from_input else None
+    )
+    if top_p is None:
+        top_p = 0.9
     torch_dtype = (
         args.torch_dtype
         if args.torch_dtype is not None
@@ -139,11 +148,10 @@ def run_encode(args) -> None:
     cfg = CodecConfig(
         model_name_or_path=model_name,
         device=device,
-        base=base,
         prompt_prefix=prompt_prefix,
-        max_new_tokens=args.max_new_tokens,
         max_context_length=args.max_context_length,
         top_k=top_k,
+        top_p=top_p,
         torch_dtype=torch_dtype,
         store_model_in_key=(
             args.include_model_in_key
@@ -171,12 +179,16 @@ def run_decode(args) -> None:
         raise ValueError("prompt-prefix is required unless present in --key")
     torch_dtype = args.torch_dtype or key.torch_dtype
     device = args.device or key.device or "cpu"
+    top_p = args.top_p if args.top_p is not None else key.top_p
+    if key.version != "v1" and top_p is None:
+        raise ValueError("top-p is required unless present in --key for variable-base decoding")
 
     set_deterministic(args.seed)
     tokenizer, model = load_model_and_tokenizer(
         model_name, device, torch_dtype=torch_dtype
     )
     encoded_text = _read_text(args.input_text)
+    key.top_p = top_p
     data = decode_text_to_data(
         encoded_text,
         key=key,

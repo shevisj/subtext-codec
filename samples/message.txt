@@ -1,2 +1,204 @@
-Once upon a time, 3,000 people were invited in by a small, local newspaper company in an effort called “3 Days 5 Cities,” in which 60 reporters went to five American states, each one covering a city of their respective hometown in an effort of community engagement, a way the paper said “for people who don’…
-In this week&apos
+Today, I'm goin to teach you about steganography.  In my previous posts about ciph
+er's toolkit and other crypto posts, you probably realized by now, I am an open
+support of encryption for all your needs.
+
+This time I want you, dear reader,  learn steganographic technique that will help you 
+store your files on websites without the fear of detection by their admins and other 
+third parties that are interested to spy and steal our personal data.
+
+### What's Stegnanography?
+---------------------------
+
+Steganogrophy is a form of hiding your information and storing them on other
+data streams, so the data is undetected from prying eye, which is very
+effective method when you want hide information that are not permitted to
+access on that certain place.
+
+There are various type steganography such as: image, video and text data,
+so let me introduce one type called image data which are easy to learn and
+apply for all beginners.
+
+
+## Tools Used:
+
+Below are some common tools that you will need in order to learn
+about image steganographic.
+
+### Tool: steganography tool.
+This is very important tools you should download on your system and get to learn.
+There are two popular image tools which I would like to introduce in
+this post: **hide4PG** for Windows and **SteganTool**  and also for linux
+distros such **Gnu Privacy Guard (gpa) with gnu tools and also another tools**
+
+I have included below some steps that can be applied in stegtool:
+
+```
+
+   steganalysis -a <input-image> [-i <key-file> [-v] | --steganalysis
+        Perform Steganalysis on a cover image
+       Options:
+        <input-image>
+                  Input Image.
+                  This must contain a steganalytis signature in order for it to be analyzed.
+                  A valid image signature file name should contain.sig and be named the
+                  same name of image, but.sig will be used as extension.
+                  For instance a.jpg will become <input-image>.sig file name for
+                .sig.
+                  Note : The <input_image> can have.ppm or.bmp or.pgm
+                         extensions and can be of different image types, not only JPEG or PPM
+
+        [-v],  [-verbose]
+                   Turn ON/OFFF the debug information to help with bug report
+
+         --key_file=<file_name>
+        --signature_file_name =<sig-file>
+```
+This tool is useful for analyzing your hidden files.
+Here you are a link where you can get it for both of
+operatinng system
+
+```
+
+https:steghide.com/Download
+
+http: www.sourceforge.com/projects/gpawin/
+http:www.gpsktools.com/
+
+https: https://www.securitycompass.org/
+
+```
+Now you should learn how it's applied and learn to install tools.
+
+
+## Learning Step: Installing steg tool.
+You are going now download and extract file that you just
+ downloaded from website link.
+
+Here's what we're going to learn:
+1: Install it by simply run command as
+`python setup install `
+and if it is already
+install run python steg install.
+
+Now it will ask about steg file, choose any image you have with
+.jpg extension.
+
+## How Steg Tool Work.
+
+StegTool allows users to store encrypted text within an image using steganography. Here is a simplified
+flow chart for this technique.
+
+*   **Choose your stegimage**. This will allow you select
+an image from any directory to
+encrypt message into
+it
+*  **Insert the image that is steg**
+  You select the image
+*   Insert the file
+ that will
+ encrypt
+    This can
+be of any
+extension such.pdf or any file you
+have with
+*.doc extension and more
+
+You need also
+add the text file to insert inside image
+Here's some step by
+ step to do steganography:
+Here's example for image
+
+### How It Is Used?
+
+To get a basic understanding, let me show
+how Steg Tool
+can help to you to get information and
+also how can
+be used in steganographic.
+
+```
+
+Here's the simple way how I use it. Let say we have to hide our file into image.
+
+Step 1) Create your message with a text file.
+
+Here is the file created by myself.
+Here you can download a text
+file.
+
+[Click
+to Download]
+
+[download.txt](https://www.gpg-tools.org/steg/download/1)
+
+Here I used simple
+`"secret" "file"`
+
+Now let me encrypt
+it.
+
+[Step 1]: Encrypt a text
+
+```sh
+
+$ steganography encrypt –image
+<IMAGE.jpg> –key 0x0
+ –key “password”
+  -message <message>
+
+```
+
+
+You may
+ask, "How is image related with this command? I just need encrypt my file." Here,
+Stegtool can be applied to encrypt the message
+inside any
+ image using Steganographic.
+
+Step2:
+Create cover image to use. (This must
+have
+extension of.jpg or any type you prefer.
+
+[Here, is a example I made
+for
+example
+image](image.png).
+[download](https:www.gpg-tools.org/steg/ download/image)
+Now,
+once your message is inserted
+into an
+ image
+file, it looks
+just a image as you normally do. Now we need encrypt it
+with the command above
+
+[steg encrypt
+message “message”
+-image “path” “path to message file”
+
+This can help to store any data
+inside of image.
+
+
+**Step 3**:
+
+
+Once your steg file
+has been encrypted and ready,
+use Steg tool for
+Steg Tool.
+```
+````
+$ steg tool –extract –message <key> –cover image –secret message
+
+
+[Steganalyser]
+You will have the same result as your first steganalysing. If
+message file does not have an steganalytic file,
+message is undetectable to pryeers and also not able
+detect from admin or others to see message.
+
+
+[here

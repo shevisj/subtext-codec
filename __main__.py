@@ -10,6 +10,7 @@ from subtext_codec.codec import (
     encode_data_to_text,
     load_codec_key,
     load_model_and_tokenizer,
+    mixed_radix_digits_to_bytes,
     save_codec_key,
     set_deterministic,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "encode_data_to_text",
     "load_codec_key",
     "load_model_and_tokenizer",
+    "mixed_radix_digits_to_bytes",
     "save_codec_key",
     "main",
     "set_deterministic",

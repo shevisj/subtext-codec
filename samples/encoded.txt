@@ -1,0 +1,8 @@
+Today, I'm goin to teach you about steganography.  It is the art and practice of concealin' information in a non-secret way, like in a seemingly innocous image or message.
+There is a famous stegnographic method called "Least Significant Bit" (LSB) substitution, where the least significnt bits are replaced with a secret message.  For example if you have a pixel value of 128 (binary 1000,000), the least significant bits would be 0.  If the secret message bit was a "1", you could replace that 0 bit to get 129 (binary 100,0.000).  
+There are also more advanced methods like "Spatial domain steganography", "Frequency Domain Steganography" (which is similar but uses a different way of lookin at the data), "Spread spectrum steganography", and more.
+Steganalysis is the process and methods of detect and reveal hidden information. There is a variety of techniques used to do so.
+Steganalysis is a very important part in the digital forensic science, and it is used to detect hidden information in digital images, videos and audio files.
+There is a lot more to stegano than just this. I'm just scratch the surface here.
+I'm glad you're intested, and I'm happy to answer more questions and provide more info.  Just let me out what you're interested and I'll be glad help.  -D
+Today I'm gonna talk to ya about a technique used to hide information, it
