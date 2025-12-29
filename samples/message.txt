@@ -1,204 +1,80 @@
-Today, I'm goin to teach you about steganography.  In my previous posts about ciph
-er's toolkit and other crypto posts, you probably realized by now, I am an open
-support of encryption for all your needs.
+Today, I'm going to teach you about steganography.  Now I know what some people might say - isn't that just a bunch of jumbled nonsense, and isn't steganalysis what all those spy shows use for cover ups and hidden information. But, actually, no! Steganography has its roots in cryptography, but is not exactly about encrypt or decrypt data. Its main goal, rather, is about hiding, well, data!
 
-This time I want you, dear reader,  learn steganographic technique that will help you 
-store your files on websites without the fear of detection by their admins and other 
-third parties that are interested to spy and steal our personal data.
+### So what exactly does stegno mean?
+The term 'Stegnography', has two roots - one Greek root "Stego-" and "Graptō", the latter means "write". Together, Stego-graphtō, can roughly translate into - to write under a cloak, or, in a broader context - hide the meaning by not changing the original text.
 
-### What's Stegnanography?
----------------------------
+Stegnography uses different methods, and it all starts with image. Let me illustrate:
 
-Steganogrophy is a form of hiding your information and storing them on other
-data streams, so the data is undetected from prying eye, which is very
-effective method when you want hide information that are not permitted to
-access on that certain place.
+-   **Cover Images** 
+   The first step in steganographic techniques, we select images which are to be covered and to which we are to add the message (in binary) into it - these cover image is the first step to encode data.
 
-There are various type steganography such as: image, video and text data,
-so let me introduce one type called image data which are easy to learn and
-apply for all beginners.
+   <figure>
+    ![]()
+     </img></p>
+       Image is being used as the first and the final layer.
+     <p/>
 
+   -  <h4>Cipher</4>
 
-## Tools Used:
-
-Below are some common tools that you will need in order to learn
-about image steganographic.
-
-### Tool: steganography tool.
-This is very important tools you should download on your system and get to learn.
-There are two popular image tools which I would like to introduce in
-this post: **hide4PG** for Windows and **SteganTool**  and also for linux
-distros such **Gnu Privacy Guard (gpa) with gnu tools and also another tools**
-
-I have included below some steps that can be applied in stegtool:
-
-```
-
-   steganalysis -a <input-image> [-i <key-file> [-v] | --steganalysis
-        Perform Steganalysis on a cover image
-       Options:
-        <input-image>
-                  Input Image.
-                  This must contain a steganalytis signature in order for it to be analyzed.
-                  A valid image signature file name should contain.sig and be named the
-                  same name of image, but.sig will be used as extension.
-                  For instance a.jpg will become <input-image>.sig file name for
-                .sig.
-                  Note : The <input_image> can have.ppm or.bmp or.pgm
-                         extensions and can be of different image types, not only JPEG or PPM
-
-        [-v],  [-verbose]
-                   Turn ON/OFFF the debug information to help with bug report
-
-         --key_file=<file_name>
-        --signature_file_name =<sig-file>
-```
-This tool is useful for analyzing your hidden files.
-Here you are a link where you can get it for both of
-operatinng system
-
-```
-
-https:steghide.com/Download
-
-http: www.sourceforge.com/projects/gpawin/
-http:www.gpsktools.com/
-
-https: https://www.securitycompass.org/
-
-```
-Now you should learn how it's applied and learn to install tools.
+     A stegano message or an embedded message will go on this, after some of its bit is hidden inside our cover Image.
 
 
-## Learning Step: Installing steg tool.
-You are going now download and extract file that you just
- downloaded from website link.
+     The process works with following step:
 
-Here's what we're going to learn:
-1: Install it by simply run command as
-`python setup install `
-and if it is already
-install run python steg install.
-
-Now it will ask about steg file, choose any image you have with
-.jpg extension.
-
-## How Steg Tool Work.
-
-StegTool allows users to store encrypted text within an image using steganography. Here is a simplified
-flow chart for this technique.
-
-*   **Choose your stegimage**. This will allow you select
-an image from any directory to
-encrypt message into
-it
-*  **Insert the image that is steg**
-  You select the image
-*   Insert the file
- that will
- encrypt
-    This can
-be of any
-extension such.pdf or any file you
-have with
-*.doc extension and more
-
-You need also
-add the text file to insert inside image
-Here's some step by
- step to do steganography:
-Here's example for image
-
-### How It Is Used?
-
-To get a basic understanding, let me show
-how Steg Tool
-can help to you to get information and
-also how can
-be used in steganographic.
-
-```
-
-Here's the simple way how I use it. Let say we have to hide our file into image.
-
-Step 1) Create your message with a text file.
-
-Here is the file created by myself.
-Here you can download a text
-file.
-
-[Click
-to Download]
-
-[download.txt](https://www.gpg-tools.org/steg/download/1)
-
-Here I used simple
-`"secret" "file"`
-
-Now let me encrypt
-it.
-
-[Step 1]: Encrypt a text
-
-```sh
-
-$ steganography encrypt –image
-<IMAGE.jpg> –key 0x0
- –key “password”
-  -message <message>
-
-```
+1  <h5>Capture and Select the cover images</h5>
+1.1    We can capture the cover images either using our mobile device or from any website.
+   After selecting we can resize the images in different formats, to hide our secret data (like text messages) using different techniques, so that the final result looks same. 
 
 
-You may
-ask, "How is image related with this command? I just need encrypt my file." Here,
-Stegtool can be applied to encrypt the message
-inside any
- image using Steganographic.
-
-Step2:
-Create cover image to use. (This must
-have
-extension of.jpg or any type you prefer.
-
-[Here, is a example I made
-for
-example
-image](image.png).
-[download](https:www.gpg-tools.org/steg/ download/image)
-Now,
-once your message is inserted
-into an
- image
-file, it looks
-just a image as you normally do. Now we need encrypt it
-with the command above
-
-[steg encrypt
-message “message”
--image “path” “path to message file”
-
-This can help to store any data
-inside of image.
+    **1  <u>Select Secret data and Resize image to embed secret text inside the cover image</h2>**
 
 
-**Step 3**:
+      To hide data into cover images first convert the cover images and data you want to embed (text data in ASCII, which has 128 different character set ) in binary. Now let’s resize the images. The smaller you go with an Image the higher quality image it gives.
 
 
-Once your steg file
-has been encrypted and ready,
-use Steg tool for
-Steg Tool.
-```
-````
-$ steg tool –extract –message <key> –cover image –secret message
+      To encode data on images is known to have an impact in terms of its quality. There's no need to encode large amounts data using small images.
+ 
+      -    <u>1   Data compression algorithms used to embed message on Cover image</h2></p> 
+ 
+ 
+     To make images small (less KB in size )we have algorithms such as LZW (Lemple,Ziv and Weiner). 
+   -    <u>1    Encoding secret messages with Binary ( ASCII  ) data using the ASCII code ( A= 65,Z = 90 etc.  and A-Z  = ASCII codes are between  32 to 126, so the 7-bit code is sufficient ) </u>
+      In encoding we convert every characters ( letters and symbols, both) to the 8 bit ( Binary ) ASCII value. We convert 8 bits  ASCII to a binary number. This  will enable you to  read and  embed message (data) on our image in form of bit, this will  enable you  to add our data  in any cover images  in the binary form,  we convert the entire  cover  into a binary and store data into that and add in the images in different locations like pixel ( red and blue color in  8-bit  pixel value). 
+
+-    <h4>Cyphertext (Encoded text)</4>
+-     In encoding message to hide on the cover image. After all process now we need to store secret data and image in different locations on the pixel in cover images.
+ 
+
+ 
+     The secret  message and  the original message are hidden on pixel locations and can only be decoded  when we are done. It can also hide a text, image and even  any type of data on images.
 
 
-[Steganalyser]
-You will have the same result as your first steganalysing. If
-message file does not have an steganalytic file,
-message is undetectable to pryeers and also not able
-detect from admin or others to see message.
+     <u>CypherText </h4> : 
+      - The original cover image and message  in which message is hidden (binary)
+       **Decoding:**
+
+-    To read data that is encoded into the cover image (original), the same steps used to embed data (in our previous explanation of how encoding process  happens  for our data). In  reverse order and  read it to see original image  as it is.
 
 
-[here
+
+      Now I'm not sure whether it’s the correct process as I’m trying it out but let me give it a go!
+
+So what I did was that,  to create a hidden secret message within my picture using a method called "least significant bit" substitution.
+
+
+So basically,  I changed the pixels (the smallest dots of a picture), one pixel at a  time and the  message is encoded  and hidden, but when I viewed the encoded message with an  steganalyis program and viewed the decoded image using a different program  the result looked almost the  exact same! So in essence, the  hidden  secret message in the image could be seen when viewing it with steganalysis but when the original picture is shown in it, there isn't  even any sign that  there was ever even any message there to be hidden!
+
+### So is this stegnographic method of data embedding the  only method or technique available out there to us, for hiding secret information within the original  cover images or  files. 
+
+**Not even close to it**
+
+While stegnographic methods  of  data hiding in pictures have  many of the  applications like:
+
+  **Secure data sharing  of images with friends or in groups, or sending images over networks**
+  
+    There's more advanced  stegnography technique to use for secure information transfer  with more complexity of embedding a data, such as
+
+1   <u>LSBs substitution </u>
+
+      It has its application  as the previous example in steganography of image steganography.
+      The process in  which LSB's  ( the  least significant  bit in a binary representation,

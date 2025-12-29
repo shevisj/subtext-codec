@@ -1,7 +1,7 @@
 {
   "version": "v2",
   "top_k": 16,
-  "prompt_prefix": "Today, I'm goin to teach you about steganography. ",
+  "prompt_prefix": "Today, I'm going to teach you about steganography. ",
   "model_name_or_path": "meta-llama/Llama-3.1-8B-Instruct",
   "device": "cuda",
   "torch_dtype": "bf16",
