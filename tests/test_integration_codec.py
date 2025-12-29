@@ -35,6 +35,7 @@ class FakeTokenizer:
         self.vocab = list(vocab)
         self.token_to_id = {token: idx for idx, token in enumerate(self.vocab)}
         self.id_to_token = {idx: token for token, idx in self.token_to_id.items()}
+        self.vocab_size = len(self.vocab)
 
         self.unk_token = "<unk>"
         self.unk_token_id = self.token_to_id[self.unk_token]
@@ -48,6 +49,9 @@ class FakeTokenizer:
         tokens = [tok for tok in text.split(" ") if tok != ""]
         ids = [self.token_to_id.get(tok, self.unk_token_id) for tok in tokens]
         return SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.long))
+
+    def __len__(self):
+        return len(self.vocab)
 
     def decode(self, ids: Sequence[int], skip_special_tokens: bool = True) -> str:
         resolved_ids = [int(i) for i in ids]
@@ -97,13 +101,13 @@ def make_fake_components(ranking: Optional[Sequence[int]] = None):
 
 
 @pytest.mark.parametrize(
-    "base,top_k,payload,prompt_prefix,ranking,store_model",
+    "top_k,top_p,payload,prompt_prefix,ranking,store_model",
     [
-        (2, None, b"hi", "alpha bravo", rotated_ranking(0), False),
-        (3, 6, b"varied", "charlie delta echo", rotated_ranking(2), True),
+        (8, 0.9, b"hi", "alpha bravo", rotated_ranking(0), False),
+        (6, 0.85, b"varied", "charlie delta echo", rotated_ranking(2), True),
         (
-            5,
             9,
+            0.95,
             bytes(range(1, 9)),
             "foxtrot golf",
             list(reversed(NON_SPECIAL_IDS)) + SPECIAL_IDS,
@@ -112,8 +116,8 @@ def make_fake_components(ranking: Optional[Sequence[int]] = None):
     ],
 )
 def test_fake_model_round_trip(
-    base: int,
     top_k: Optional[int],
+    top_p: float,
     payload: bytes,
     prompt_prefix: str,
     ranking: Sequence[int],
@@ -123,15 +127,17 @@ def test_fake_model_round_trip(
     cfg = CodecConfig(
         model_name_or_path="fake-model" if store_model else "transient-model",
         device="cpu",
-        base=base,
         prompt_prefix=prompt_prefix,
-        max_new_tokens=128,
         max_context_length=256,
         top_k=top_k,
+        top_p=top_p,
         store_model_in_key=store_model,
     )
 
     encoded, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    assert key.version == "v2"
+    assert key.payload_length == len(payload)
+
     decoded = decode_text_to_data(
         encoded,
         key=key,
@@ -142,7 +148,7 @@ def test_fake_model_round_trip(
         max_context_length=cfg.max_context_length,
     )
 
-    assert decoded == payload.lstrip(b"\x00")
+    assert decoded == payload
     if store_model:
         assert key.model_name_or_path == cfg.model_name_or_path
     else:
@@ -154,11 +160,10 @@ def test_fake_model_with_noise_before_and_after_prompt() -> None:
     cfg = CodecConfig(
         model_name_or_path="fake-noise-model",
         device="cpu",
-        base=4,
         prompt_prefix="hotel india",
-        max_new_tokens=64,
         max_context_length=128,
         top_k=6,
+        top_p=0.9,
     )
     payload = b"noisy payload"
     encoded, key = encode_data_to_text(payload, cfg, model, tokenizer)
@@ -173,7 +178,61 @@ def test_fake_model_with_noise_before_and_after_prompt() -> None:
         device="cpu",
         max_context_length=cfg.max_context_length,
     )
-    assert decoded == payload.lstrip(b"\x00")
+    assert decoded == payload
+
+
+def test_fake_model_with_leading_zeros() -> None:
+    """Verify that payloads with leading zero bytes are correctly preserved."""
+    tokenizer, model = make_fake_components(rotated_ranking(0))
+    cfg = CodecConfig(
+        model_name_or_path="fake-model",
+        device="cpu",
+        prompt_prefix="alpha bravo",
+        max_context_length=256,
+        top_k=8,
+        top_p=0.9,
+    )
+
+    payload = b"\x00\x00\x01\x02\x03"
+    encoded, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    assert key.payload_length == 5
+
+    decoded = decode_text_to_data(
+        encoded,
+        key=key,
+        prompt_prefix=cfg.prompt_prefix,
+        model=model,
+        tokenizer=tokenizer,
+        device="cpu",
+    )
+    assert decoded == payload
+
+
+def test_fake_model_empty_payload() -> None:
+    """Verify that empty payloads work correctly."""
+    tokenizer, model = make_fake_components(rotated_ranking(0))
+    cfg = CodecConfig(
+        model_name_or_path="fake-model",
+        device="cpu",
+        prompt_prefix="alpha bravo",
+        max_context_length=256,
+        top_k=8,
+        top_p=0.9,
+    )
+
+    payload = b""
+    encoded, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    assert key.payload_length == 0
+
+    decoded = decode_text_to_data(
+        encoded,
+        key=key,
+        prompt_prefix=cfg.prompt_prefix,
+        model=model,
+        tokenizer=tokenizer,
+        device="cpu",
+    )
+    assert decoded == payload
 
 
 def test_cli_round_trip_with_fake_model(monkeypatch, tmp_path) -> None:
@@ -198,8 +257,6 @@ def test_cli_round_trip_with_fake_model(monkeypatch, tmp_path) -> None:
             "fake-cli-model",
             "--device",
             "cpu",
-            "--base",
-            "3",
             "--prompt-prefix",
             "alpha bravo charlie",
             "--input-bytes",
@@ -210,8 +267,8 @@ def test_cli_round_trip_with_fake_model(monkeypatch, tmp_path) -> None:
             str(key_path),
             "--top-k",
             "6",
-            "--max-new-tokens",
-            "256",
+            "--top-p",
+            "0.9",
         ]
     )
 
@@ -227,10 +284,65 @@ def test_cli_round_trip_with_fake_model(monkeypatch, tmp_path) -> None:
         ]
     )
 
-    assert output_bytes.read_bytes() == payload.lstrip(b"\x00")
+    assert output_bytes.read_bytes() == payload
 
     key = subtext_codec.load_codec_key(key_path)
     assert key.model_name_or_path == "fake-cli-model"
     assert key.prompt_prefix == "alpha bravo charlie"
-    assert key.base == 3
+    assert key.version == "v2"
     assert key.top_k == 6
+    assert key.top_p == pytest.approx(0.9)
+    assert key.payload_length == len(payload)
+
+
+def test_cli_round_trip_with_leading_zeros(monkeypatch, tmp_path) -> None:
+    """Verify CLI properly preserves payloads with leading zero bytes."""
+    ranking = rotated_ranking(0)
+
+    def fake_loader(model_name_or_path, device, torch_dtype=None):
+        return make_fake_components(ranking)
+
+    monkeypatch.setattr(cli, "load_model_and_tokenizer", fake_loader)
+
+    payload = b"\x00\x00\x00hello"
+    input_bytes = tmp_path / "input.bin"
+    input_bytes.write_bytes(payload)
+    output_text = tmp_path / "encoded.txt"
+    output_bytes = tmp_path / "decoded.bin"
+    key_path = tmp_path / "key.json"
+
+    cli.main(
+        [
+            "encode",
+            "--model-name-or-path",
+            "fake-cli-model",
+            "--device",
+            "cpu",
+            "--prompt-prefix",
+            "alpha bravo",
+            "--input-bytes",
+            str(input_bytes),
+            "--output-text",
+            str(output_text),
+            "--key",
+            str(key_path),
+            "--top-k",
+            "8",
+            "--top-p",
+            "0.9",
+        ]
+    )
+
+    cli.main(
+        [
+            "decode",
+            "--input-text",
+            str(output_text),
+            "--output-bytes",
+            str(output_bytes),
+            "--key",
+            str(key_path),
+        ]
+    )
+
+    assert output_bytes.read_bytes() == payload

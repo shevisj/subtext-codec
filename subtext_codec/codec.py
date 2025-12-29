@@ -1,6 +1,5 @@
 import dataclasses
 import json
-import math
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -41,6 +40,7 @@ class CodecKey:
     torch_dtype: Optional[str] = None
     version: str = "v2"
     base: Optional[int] = None  # legacy fixed-base keys
+    payload_length: Optional[int] = None  # exact byte length for proper reconstruction
 
     def to_dict(self) -> dict:
         data = {
@@ -59,6 +59,8 @@ class CodecKey:
             if self.top_p is None:
                 raise ValueError("top_p is required for v2 codec keys")
             data["top_p"] = self.top_p
+        if self.payload_length is not None:
+            data["payload_length"] = self.payload_length
         return data
 
     @classmethod
@@ -73,12 +75,13 @@ class CodecKey:
         model_name_or_path = data.get("model_name_or_path")
         device = data.get("device")
         torch_dtype = data.get("torch_dtype")
+        payload_length_raw = data.get("payload_length")
+        payload_length = None if payload_length_raw is None else int(payload_length_raw)
 
         if version == "v1":
             base = int(data["base"])
             if base < 2:
                 raise ValueError("base must be >= 2")
-            # Ignore any legacy termination metadata in existing key files
             return cls(
                 base=base,
                 top_k=top_k,
@@ -87,6 +90,7 @@ class CodecKey:
                 device=device,
                 torch_dtype=torch_dtype,
                 version=version,
+                payload_length=payload_length,
             )
 
         if version != "v2":
@@ -105,6 +109,7 @@ class CodecKey:
             device=device,
             torch_dtype=torch_dtype,
             version=version,
+            payload_length=payload_length,
         )
 
 
@@ -163,7 +168,7 @@ def load_model_and_tokenizer(
         tokenizer.pad_token = tokenizer.eos_token
     model_kwargs = {}
     if resolved_dtype is not None:
-        model_kwargs["dtype"] = resolved_dtype
+        model_kwargs["torch_dtype"] = resolved_dtype
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
     model.to(device)
     model.eval()
@@ -184,16 +189,23 @@ def bytes_to_base_digits(data: bytes, base: int) -> List[int]:
     return digits
 
 
-def base_digits_to_bytes(digits: Iterable[int], base: int) -> bytes:
+def base_digits_to_bytes(
+    digits: Iterable[int], base: int, length: Optional[int] = None
+) -> bytes:
     if base < 2:
         raise ValueError("base must be >= 2")
+    digit_list = list(digits)
     n = 0
-    for d in digits:
+    for d in digit_list:
         if d < 0 or d >= base:
             raise ValueError(f"digit {d} out of range for base {base}")
         n = n * base + d
+    if length is not None:
+        if n == 0 and length == 0:
+            return b""
+        return n.to_bytes(length, byteorder="big", signed=False)
     if n == 0:
-        return b"" if len(digits) == 0 else b"\x00"
+        return b"" if len(digit_list) == 0 else b"\x00"
     length_bytes = (n.bit_length() + 7) // 8
     return n.to_bytes(length_bytes, byteorder="big", signed=False)
 
@@ -240,7 +252,7 @@ def _select_rank_band(
 
 
 def mixed_radix_digits_to_bytes(
-    digits: Iterable[int], bases: Iterable[int]
+    digits: Iterable[int], bases: Iterable[int], length: Optional[int] = None
 ) -> bytes:
     digit_list = list(digits)
     base_list = list(bases)
@@ -253,6 +265,10 @@ def mixed_radix_digits_to_bytes(
         if digit < 0 or digit >= base:
             raise ValueError(f"digit {digit} out of range for base {base}")
         n = n * base + digit
+    if length is not None:
+        if n == 0 and length == 0:
+            return b""
+        return n.to_bytes(length, byteorder="big", signed=False)
     if n == 0:
         return b"" if len(digit_list) == 0 else b"\x00"
     length_bytes = (n.bit_length() + 7) // 8
@@ -325,6 +341,7 @@ def _encode_variable_base_digits(
         device=cfg.device,
         torch_dtype=cfg.torch_dtype,
         version="v2",
+        payload_length=len(data),
     )
     return input_ids, key
 
@@ -383,7 +400,7 @@ def _decode_fixed_base(
     if not terminated:
         raise ValueError("Termination token not found in encoded text")
 
-    return base_digits_to_bytes(digits, key.base)
+    return base_digits_to_bytes(digits, key.base, length=key.payload_length)
 
 
 def _decode_variable_base(
@@ -428,7 +445,7 @@ def _decode_variable_base(
     if not terminated:
         raise ValueError("Termination token not found in encoded text")
 
-    return mixed_radix_digits_to_bytes(digits, bases)
+    return mixed_radix_digits_to_bytes(digits, bases, length=key.payload_length)
 
 
 def decode_text_to_data(

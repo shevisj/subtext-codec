@@ -53,7 +53,7 @@ python -m subtext_codec decode ...
 - **Determinism**: `set_deterministic(seed)` ensures reproducibility via torch seeding and cuDNN config.
 - **Termination**: Encoded text ends with a terminator token at rank equal to the active base; decoder stops there.
 - **Context handling**: Decoder extracts prompt prefix from encoded text and only processes the generated portion.
-- **Leading zeros**: Decoded bytes strip leading `\x00` (recoverable with external length metadata).
+- **Payload length preservation**: The key stores `payload_length` to ensure exact byte reconstruction, including leading zero bytes.
 
 ## Development Guidelines
 
