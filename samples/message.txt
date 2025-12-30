@@ -1,80 +1,91 @@
-Today, I'm going to teach you about steganography.  Now I know what some people might say - isn't that just a bunch of jumbled nonsense, and isn't steganalysis what all those spy shows use for cover ups and hidden information. But, actually, no! Steganography has its roots in cryptography, but is not exactly about encrypt or decrypt data. Its main goal, rather, is about hiding, well, data!
+Today, I'm going to teach you about steganography.  Now I know what some people might say - isn't that just a bunch of jumbled nonsense, and isn't steganalysis like, the opposite of crypto-analysis?
 
-### So what exactly does stegno mean?
-The term 'Stegnography', has two roots - one Greek root "Stego-" and "Graptō", the latter means "write". Together, Stego-graphtō, can roughly translate into - to write under a cloak, or, in a broader context - hide the meaning by not changing the original text.
+To that, I'd like to say... sort of!
 
-Stegnography uses different methods, and it all starts with image. Let me illustrate:
+First of, I want you explain to you, just what is Steg and what does steganalysis entails. We will dive deep to the concept behind steganalysis, including different types, its techniques, tools and challenges associated with the subject.
 
--   **Cover Images** 
-   The first step in steganographic techniques, we select images which are to be covered and to which we are to add the message (in binary) into it - these cover image is the first step to encode data.
+So, buckle in! We have a whole new realm to cover. I want you to know by the time we finish with steganography, I'll make you proficient on steganographic techniques used for secure communications. You might want a paper, or two, or three for a future cryptography exam (you can get them online or borrow from friends, just say no to copyright).
 
-   <figure>
-    ![]()
-     </img></p>
-       Image is being used as the first and the final layer.
-     <p/>
+Steganalysis
+-----------
 
-   -  <h4>Cipher</4>
+In this post we'll talk more on **Steganalysis** - a method of detecting the use and content of a hidden image. This method involves examining a suspected message, in an attempt to detect any possible hiding method or detect any changes that are likely made by someone in the process.
 
-     A stegano message or an embedded message will go on this, after some of its bit is hidden inside our cover Image.
+There is much work on this, in order for you to become a master on this. The key point, I'm going with is **the fact** that, unlike encryption techniques which aim at securing communication from unwanted observers, Steganographic technique, **aim at securing messages by embedding data inside images and multimedia objects** in an innocuous-looking cover.
 
+Types
+------
 
-     The process works with following step:
+Here is some of types that are out here
 
-1  <h5>Capture and Select the cover images</h5>
-1.1    We can capture the cover images either using our mobile device or from any website.
-   After selecting we can resize the images in different formats, to hide our secret data (like text messages) using different techniques, so that the final result looks same. 
+1. **Least significant bit steganalysis**: This method uses least significant bit of each image to encode and decode secret data.
 
+2.  **Frequency Domain Steganalysis:** Stego-key and secret image will be transformed from spatial to spatial frequency. It's easy to encode data inside spatial domain than in frequency domain as there's no human visible.
 
-    **1  <u>Select Secret data and Resize image to embed secret text inside the cover image</h2>**
+    This steg type was made known through the book: [An Introduction to Digital Watermarking by M. Arnold, M. Bellamy and K.Miu, IEEE, 1999.][4]
+3. **Color Image steg analysis: Color Image is a more common method to use as it allows for a wider scope in embedding more data, since color has three color components, (Red Green, and blue).
 
+Types
+------ 
 
-      To hide data into cover images first convert the cover images and data you want to embed (text data in ASCII, which has 128 different character set ) in binary. Now let’s resize the images. The smaller you go with an Image the higher quality image it gives.
+1  * Least Significant bit(LSB):*
 
+Least Significant Bit method (also called Least significant Bit ( LSB) substitution, least Significant bit ( LSB ) is used in Steg methods where we hide our secret data using least Significant Bit of an image and is the easiest steg method as we don't require much complexity for this. 
 
-      To encode data on images is known to have an impact in terms of its quality. There's no need to encode large amounts data using small images.
- 
-      -    <u>1   Data compression algorithms used to embed message on Cover image</h2></p> 
- 
- 
-     To make images small (less KB in size )we have algorithms such as LZW (Lemple,Ziv and Weiner). 
-   -    <u>1    Encoding secret messages with Binary ( ASCII  ) data using the ASCII code ( A= 65,Z = 90 etc.  and A-Z  = ASCII codes are between  32 to 126, so the 7-bit code is sufficient ) </u>
-      In encoding we convert every characters ( letters and symbols, both) to the 8 bit ( Binary ) ASCII value. We convert 8 bits  ASCII to a binary number. This  will enable you to  read and  embed message (data) on our image in form of bit, this will  enable you  to add our data  in any cover images  in the binary form,  we convert the entire  cover  into a binary and store data into that and add in the images in different locations like pixel ( red and blue color in  8-bit  pixel value). 
+This is a basic concept used widely. 
 
--    <h4>Cyphertext (Encoded text)</4>
--     In encoding message to hide on the cover image. After all process now we need to store secret data and image in different locations on the pixel in cover images.
- 
+This steganographic technique was invented by **Stine** (USA). This method works well in image Steg where each Pixel is used in 8-bit representation in image data where we take last least Significant bit and we hide data with that LSB of each image.
 
- 
-     The secret  message and  the original message are hidden on pixel locations and can only be decoded  when we are done. It can also hide a text, image and even  any type of data on images.
+The following diagram is showing that
 
+*   We hide the bits by substituting them to LSB.
+    <https\://drive.google\>.com/driv/folder/1KxuQ3jzKjZzj4kQqg6e3y3j5z5Q>
 
-     <u>CypherText </h4> : 
-      - The original cover image and message  in which message is hidden (binary)
-       **Decoding:**
+The image we used has the value: 01111001. This binary number can represent the ASCII code 109. We change the last bit from 1 to a zero, to obtain 010111000 and 101 (or 8+0 =8), and change this 101 binary value, that 101 can have value (109-  16)= 093 which will look different than 101 in a digital computer
 
--    To read data that is encoded into the cover image (original), the same steps used to embed data (in our previous explanation of how encoding process  happens  for our data). In  reverse order and  read it to see original image  as it is.
+LSb is widely used method as the least Significant bit has the value from the last digit of a number
 
+1   **Color Steg:*
 
+The main concept here is the fact, Color Image, that it's an **Image of color.**
 
-      Now I'm not sure whether it’s the correct process as I’m trying it out but let me give it a go!
+Here you can hide more information using **3 Color** channels in this color channel of the steg images that's called the Color Steg technique which has 24 bit in a Pixel in RGB Color image.
 
-So what I did was that,  to create a hidden secret message within my picture using a method called "least significant bit" substitution.
+In this case, you will use color values in an image for your steg data which gives  2-  5  more bytes to encode than an RGB  Image of size 512x512, where a normal RGB image  would only give you a 512\*\*
 
+*   <http\:///en\>.Wikipedia\>/Color Image\>
+2   *   Color Space:*
 
-So basically,  I changed the pixels (the smallest dots of a picture), one pixel at a  time and the  message is encoded  and hidden, but when I viewed the encoded message with an  steganalyis program and viewed the decoded image using a different program  the result looked almost the  exact same! So in essence, the  hidden  secret message in the image could be seen when viewing it with steganalysis but when the original picture is shown in it, there isn't  even any sign that  there was ever even any message there to be hidden!
+ Color Steganography has different colors to work on that will hide more bytes than color channel of image.
 
-### So is this stegnographic method of data embedding the  only method or technique available out there to us, for hiding secret information within the original  cover images or  files. 
+3  *   RGB color:*
 
-**Not even close to it**
+   <http\:///en\>/wikipedia/rgb\>(RGB stands for Red Green, and blue color).
 
-While stegnographic methods  of  data hiding in pictures have  many of the  applications like:
+**Techniques of Color Image:*
 
-  **Secure data sharing  of images with friends or in groups, or sending images over networks**
-  
-    There's more advanced  stegnography technique to use for secure information transfer  with more complexity of embedding a data, such as
+**Frequency domain Steg technique*
 
-1   <u>LSBs substitution </u>
+1. **DCT (discrete cosine transform):* This transform technique will break your image down from 512\*  into a number of DCT Blocks which will then transform from DDC (spacial Domain image).  It is an image Steganography technique in frequency domain
 
-      It has its application  as the previous example in steganography of image steganography.
-      The process in  which LSB's  ( the  least significant  bit in a binary representation,
+**Tools and Software's**
+
+We use many different tool's and Software to analyze a Steg file
+
+1  **Jpools steganalyzer :**   is one the top rated steganography tool's which is free software for detecting and removing the Stego information.
+
+   You can find it here, <https://drive\.google\>.com/file/ view/dl/\>\*\_\*\_/fileID>
+
+    Here's an excerpt about this from this page, that the tool is capable of extracting steganography files that were made by some popular Steg softwares:
+
+<https\:///drive\.google\. com/view/d/ 1x2y2z1u2y3i34o2>
+
+Here, the page is showing all Stego tools in order to find which is suitable and useful to our use case:
+
+<https://github\#/steagano\#/files/steg tools.zip\>/download\>\#\</>
+
+You can also check [ this tool on Google Code][5], [ here on Google ] [1]: http://jpoolsteganalyzers.com
+
+*   <https://jsteg.github.io/>  (This one works on a web and desktop)
+
+    There
