@@ -134,9 +134,13 @@ subtext-codec decode \
   --output-bytes samples/decoded.txt
 ```
 
-The key was created with the prompt prefix `"Once upon a time, "` and a Llama 3.1 8B model; decoding requires access to the same model and tokenizer. The sample key is v2 and uses the variable-base codec; legacy v1 keys are still decoded via the fixed-base path if encountered.
+The key was created with the prompt prefix `"Today, I'm going to teach you about steganography. "` and a Llama 3.1 8B instruct model; decoding requires access to the same model and tokenizer. The sample key is v2 and uses the variable-base codec; legacy v1 keys are still decoded via the fixed-base path if encountered.
 
 ---
+
+### Programatic Usage
+
+See the [demo notebook](/demo.ipynb) for how to use this library wihtin a Python script or notebook.
 
 ## Limitations (for now)
 
