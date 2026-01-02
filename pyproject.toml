@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "subtext-codec"
-version = "0.1.0"
+version = "0.1.1"
 description = "Steganographic data encoding in LLM-generated text using logit rank steering."
 readme = "README.md"
 license = { file = "LICENSE" }
