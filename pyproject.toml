@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Steganographic data encoding in LLM-generated text using logit rank steering."
 readme = "README.md"
 license = { file = "LICENSE" }
-authors = [{ name = "Shevis Johnson" , email = "shevisjohnson@gmail.com" }]
+authors = [{ name = "Shevis Johnson" , email = "hello@shev.is" }]
 requires-python = ">=3.10"
 dependencies = [
     "torch==2.9.1",
@@ -24,9 +24,9 @@ subtext-codec = "subtext_codec.cli:main"
 subtext = "subtext_codec.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/shevisj/subtext"
-Repository = "https://github.com/shevisj/subtext"
-Issues = "https://github.com/shevisj/subtext/issues"
+Homepage = "https://github.com/shevisj/subtext-codec"
+Repository = "https://github.com/shevisj/subtext-codec"
+Issues = "https://github.com/shevisj/subtext-codec/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["subtext_codec"]
