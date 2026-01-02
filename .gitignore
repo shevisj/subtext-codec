@@ -10,3 +10,4 @@ dist/
 uv.lock
 AGENTS.md
 CLAUDE.md
+.ipynb_checkpoints/
