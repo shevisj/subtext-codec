@@ -161,8 +161,9 @@ def load_model_and_tokenizer(
     model_name_or_path: str,
     device: str,
     torch_dtype: Optional[str] = None,
+    seed: int = 0,
 ):
-    set_deterministic()
+    set_deterministic(seed)
     resolved_dtype = _parse_torch_dtype(torch_dtype)
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     if tokenizer.pad_token_id is None:
