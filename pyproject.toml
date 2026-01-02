@@ -7,7 +7,6 @@ name = "subtext-codec"
 version = "0.1.1"
 description = "Steganographic data encoding in LLM-generated text using logit rank steering."
 readme = "README.md"
-license = { file = "LICENSE" }
 authors = [{ name = "Shevis Johnson" , email = "hello@shev.is" }]
 requires-python = ">=3.10"
 dependencies = [
