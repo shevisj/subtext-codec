@@ -8,3 +8,5 @@ dist/
 *.egg-info/
 .uv-cache/
 uv.lock
+AGENTS.md
+CLAUDE.md
