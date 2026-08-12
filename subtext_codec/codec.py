@@ -1,237 +1,276 @@
+"""Steganographic data encoding in LLM-generated text.
+
+The payload drives an arithmetic decoder whose model is the language model's
+own next-token distribution. Emitting a token of probability ``p`` consumes
+``-log2(p)`` payload bits, so confident steps carry almost nothing and
+uncertain ones carry a lot. Two consequences follow, and they are the whole
+point of the design:
+
+* The generated text is distributed exactly as ordinary sampling at the chosen
+  temperature would be. Nothing is forced off-distribution.
+* Capacity per token is the distribution's entropy, which is the information
+  -theoretic ceiling for text that stays indistinguishable from sampling.
+
+Recovering the payload replays the same distributions and runs the arithmetic
+*encoder* over the observed tokens, which reproduces the bitstream.
+
+Three invariants hold it together:
+
+* **Symmetry** -- encoder and decoder derive the candidate set and its
+  frequency table from the same function of the same token prefix.
+* **Tokenizer stability** -- a candidate is only usable if appending it leaves
+  the surrounding text re-tokenizing to the same ids. Without this the decoder
+  reads a different id stream than the encoder wrote.
+* **Self-inverse coding** -- the encoder re-encodes as it goes and checks it
+  reproduces the payload before returning. This is not paranoia: feeding the
+  coder a degenerate tail silently costs the payload's last two bits.
+"""
+
+from __future__ import annotations
+
 import dataclasses
 import json
-from typing import Iterable, List, Optional, Tuple, Union
+import struct
+import zlib
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .arithmetic import (
+    ENCODER_TAIL,
+    FREQ_TOTAL,
+    ArithmeticDecoder,
+    ArithmeticEncoder,
+    cumulative,
+    from_bits,
+    quantize_frequencies,
+    to_bits,
+)
 
-def _validate_top_p(top_p: Optional[float]) -> float:
-    if top_p is None:
-        raise ValueError("top_p is required for variable-base encoding/decoding")
+#: Wire format. Matches the 1.0 release; there is no other format.
+CODEC_VERSION = "v1"
+
+#: Candidate cap used when a config leaves ``top_k`` unset.
+DEFAULT_TOP_K = 64
+
+#: Sampling temperature used when a config leaves it unset. This is the
+#: capacity dial: 1.0 gives the most natural text but the least payload per
+#: token, and raising it trades naturalness for density. 1.5 measures as the
+#: knee of that curve on a 7B model.
+DEFAULT_TEMPERATURE = 1.5
+
+#: Fewest candidates a step can work with. Arithmetic coding needs no
+#: terminator token, so two is genuinely enough.
+MIN_ALPHABET = 2
+
+#: Trailing tokens fed to the tokenizer-stability check. Comfortably longer
+#: than the longest merge any mainstream BPE vocabulary performs.
+SAFE_WINDOW = 16
+
+#: Refuse payloads whose declared length is implausible rather than allocating
+#: for them; a wrong key or model usually shows up as a nonsense length.
+MAX_PAYLOAD_BYTES = 1 << 24
+
+#: Backstop against a coder that stops making progress. Ordinary low-entropy
+#: runs emit no bits for a few steps, so this is deliberately generous.
+_STALL_LIMIT = 1000
+
+#: length (uint32) + crc32 (uint32)
+_HEADER = struct.Struct(">II")
+_HEADER_BITS = _HEADER.size * 8
+
+#: Called as ``progress(done, total)``; ``total`` is None when unknown.
+ProgressFn = Callable[[int, Optional[int]], None]
+
+
+# --------------------------------------------------------------------------
+# configuration and keys
+# --------------------------------------------------------------------------
+
+
+def _validate_temperature(temperature: Optional[float]) -> float:
+    if temperature is None:
+        return DEFAULT_TEMPERATURE
     try:
-        value = float(top_p)
+        value = float(temperature)
     except (TypeError, ValueError) as exc:
-        raise ValueError("top_p must be a float between 0 and 1") from exc
-    if value <= 0 or value > 1:
-        raise ValueError("top_p must be in the interval (0, 1]")
+        raise ValueError("temperature must be a positive number") from exc
+    if not 0 < value <= 10:
+        raise ValueError("temperature must be in the interval (0, 10]")
+    return value
+
+
+def _validate_top_k(top_k: Optional[int]) -> int:
+    if top_k is None:
+        return DEFAULT_TOP_K
+    value = int(top_k)
+    if value < MIN_ALPHABET:
+        raise ValueError(f"top_k must be >= {MIN_ALPHABET}")
     return value
 
 
 @dataclasses.dataclass
 class CodecConfig:
-    """Configuration for encoding binary data into steganographic text.
-
-    This dataclass holds all parameters needed to encode data using the codec.
-    The encoder uses these settings to control token selection during text generation.
+    """Parameters controlling how a payload is hidden in generated text.
 
     Attributes:
-        model_name_or_path: HuggingFace model identifier or local path to the model.
-        device: Computation device ("cuda", "cpu", or specific device like "cuda:0").
-        prompt_prefix: Text prompt that precedes the generated steganographic content.
-            Choose a prompt that provides good context for natural text generation.
-        max_context_length: Optional maximum context window size. If None, uses the
-            model's default. Raises ValueError if exceeded during encoding.
-        top_k: Maximum number of candidate tokens considered at each generation step.
-            Higher values increase encoding capacity but may reduce text naturalness.
-            If None, all vocabulary tokens are candidates (limited by top_p).
-        top_p: Nucleus sampling threshold (0.0 to 1.0]. Only tokens within this
-            cumulative probability mass are considered. Lower values produce more
-            focused/natural text but reduce encoding capacity per token. Default: 0.9.
-        torch_dtype: Model precision ("float16", "bf16", "float32", or "auto").
-            Use "bf16" for bfloat16 on supported hardware. If None, uses model default.
-        store_model_in_key: If True, saves model_name_or_path in the codec key for
-            easier decoding. Set to False if you want to keep model choice private.
+        model_name_or_path: HuggingFace model id or local path to a causal LM.
+        device: Torch device string, e.g. ``"cpu"``, ``"cuda"``, ``"cuda:0"``.
+        prompt_prefix: Text preceding the generated content. It anchors the
+            model's distribution and must be reproduced exactly to decode.
+        max_context_length: Optional cap on total sequence length. Clamped to
+            the model's own context window, which is used when this is None.
+        top_k: Candidates considered per step. This bounds how much work the
+            stability filter does; it is not a capacity dial.
+        temperature: Sampling temperature, and the real capacity dial. Higher
+            values flatten the distribution, so each token carries more payload
+            and the cover text gets shorter but more erratic.
+        torch_dtype: Model precision, one of ``auto``, ``float16``/``fp16``,
+            ``bfloat16``/``bf16``, ``float32``/``fp32``. None keeps the
+            checkpoint's dtype.
+        store_model_in_key: Persist the model id in the key so decoding does
+            not have to restate it.
+        max_new_tokens: Optional ceiling on generated tokens; encoding raises
+            rather than running away if the payload does not fit.
     """
 
     model_name_or_path: str
     device: str
     prompt_prefix: str
     max_context_length: Optional[int] = None
-    top_k: Optional[int] = None
-    top_p: float = 0.9
+    top_k: Optional[int] = DEFAULT_TOP_K
+    temperature: float = DEFAULT_TEMPERATURE
     torch_dtype: Optional[str] = None
     store_model_in_key: bool = False
+    max_new_tokens: Optional[int] = None
 
 
 @dataclasses.dataclass
 class CodecKey:
-    """Metadata required to decode steganographic text back to original bytes.
-
-    The codec key is generated during encoding and must be provided (along with the
-    same model and prompt) to decode the hidden data. Treat this like a password -
-    without it, the message cannot be recovered.
-
-    The key supports two versions:
-        - v1 (legacy): Fixed-base encoding with a constant radix stored in `base`
-        - v2 (current): Dynamic mixed-radix encoding using `top_p` for adaptive bases
+    """Everything needed to turn encoded text back into the original bytes.
 
     Attributes:
-        top_k: Maximum token candidates used during encoding. Must match decoding.
-        top_p: Nucleus sampling threshold for v2 keys. Required for v2, None for v1.
-        prompt_prefix: The prompt that preceded the encoded text. Used for validation.
-        model_name_or_path: HuggingFace model identifier (if stored during encoding).
-        device: Computation device used during encoding.
-        torch_dtype: Model precision used during encoding.
-        version: Codec version ("v1" for fixed-base, "v2" for dynamic mixed-radix).
-        base: Fixed radix for v1 keys only. Must be >= 2.
-        payload_length: Exact byte count of the original payload. Required to
-            correctly reconstruct payloads with leading zero bytes.
-
-    Methods:
-        to_dict: Serialize the key to a JSON-compatible dictionary.
-        from_dict: Deserialize a key from a dictionary (classmethod).
+        top_k: Candidate cap used at encode time. Must match to decode.
+        temperature: Temperature used at encode time. Must match to decode.
+        prompt_prefix: Prompt the encoded text was generated from.
+        model_name_or_path: Model id, when the encoder was told to store it.
+        device: Device used at encode time, reused as a decode default.
+        torch_dtype: Precision used at encode time. Decoding in a different
+            precision changes the logits and will not round-trip.
+        version: Wire format; always ``CODEC_VERSION``.
     """
 
     top_k: Optional[int]
-    top_p: Optional[float] = None
+    temperature: Optional[float] = None
     prompt_prefix: Optional[str] = None
     model_name_or_path: Optional[str] = None
     device: Optional[str] = None
     torch_dtype: Optional[str] = None
-    version: str = "v2"
-    base: Optional[int] = None  # legacy fixed-base keys
-    payload_length: Optional[int] = None  # exact byte length for proper reconstruction
+    version: str = CODEC_VERSION
 
     def to_dict(self) -> dict:
-        data = {
+        if self.temperature is None:
+            raise ValueError("temperature is required to serialize a codec key")
+        return {
             "version": self.version,
             "top_k": self.top_k,
+            "temperature": self.temperature,
             "prompt_prefix": self.prompt_prefix,
             "model_name_or_path": self.model_name_or_path,
             "device": self.device,
             "torch_dtype": self.torch_dtype,
         }
-        if self.version == "v1":
-            if self.base is None:
-                raise ValueError("base is required for v1 codec keys")
-            data["base"] = self.base
-        else:
-            if self.top_p is None:
-                raise ValueError("top_p is required for v2 codec keys")
-            data["top_p"] = self.top_p
-        if self.payload_length is not None:
-            data["payload_length"] = self.payload_length
-        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "CodecKey":
-        version = data.get("version", "v1")
-        top_k_raw = data.get("top_k")
-        if isinstance(top_k_raw, str) and top_k_raw.lower() == "none":
-            top_k = None
-        else:
-            top_k = None if top_k_raw is None else int(top_k_raw)
-        prompt_prefix = data.get("prompt_prefix")
-        model_name_or_path = data.get("model_name_or_path")
-        device = data.get("device")
-        torch_dtype = data.get("torch_dtype")
-        payload_length_raw = data.get("payload_length")
-        payload_length = None if payload_length_raw is None else int(payload_length_raw)
-
-        if version == "v1":
-            base = int(data["base"])
-            if base < 2:
-                raise ValueError("base must be >= 2")
-            return cls(
-                base=base,
-                top_k=top_k,
-                prompt_prefix=prompt_prefix,
-                model_name_or_path=model_name_or_path,
-                device=device,
-                torch_dtype=torch_dtype,
-                version=version,
-                payload_length=payload_length,
+        version = data.get("version")
+        if version != CODEC_VERSION:
+            raise ValueError(f"Unsupported codec key version: {version!r}")
+        # Pre-1.0 releases also numbered a format "v1", but it was rank coding
+        # and carried `base`/`top_p` instead of a temperature. Name that case
+        # rather than letting it fail as a missing field.
+        if "temperature" not in data and ("base" in data or "top_p" in data):
+            raise ValueError(
+                "this key predates subtext-codec 1.0 (it uses the old rank-coding "
+                "format) and can no longer be read. Install subtext-codec~=0.2.0 "
+                "to recover the message, or re-encode the payload"
             )
 
-        if version != "v2":
-            raise ValueError(f"Unsupported codec key version: {version}")
-
-        top_p_raw = data.get("top_p")
-        if top_p_raw is None:
-            raise ValueError("top_p missing from codec key (v2 requires it)")
-        top_p = _validate_top_p(float(top_p_raw))
+        temperature = data.get("temperature")
+        if temperature is None:
+            raise ValueError("temperature missing from codec key")
+        top_k_raw = data.get("top_k")
 
         return cls(
-            top_p=top_p,
-            top_k=top_k,
-            prompt_prefix=prompt_prefix,
-            model_name_or_path=model_name_or_path,
-            device=device,
-            torch_dtype=torch_dtype,
+            top_k=None if top_k_raw is None else int(top_k_raw),
+            temperature=_validate_temperature(float(temperature)),
+            prompt_prefix=data.get("prompt_prefix"),
+            model_name_or_path=data.get("model_name_or_path"),
+            device=data.get("device"),
+            torch_dtype=data.get("torch_dtype"),
             version=version,
-            payload_length=payload_length,
         )
 
 
 def save_codec_key(key: CodecKey, path: str) -> None:
-    """Save a codec key to a JSON file.
-
-    The key file is essential for decoding - share it securely with the intended
-    recipient along with the encoded message.
-
-    Args:
-        key: The CodecKey to save.
-        path: File path where the key will be written (overwrites if exists).
-
-    Example:
-        >>> key = encode_data_to_text(data, config, model, tokenizer)[1]
-        >>> save_codec_key(key, "my_key.json")
-    """
+    """Write a codec key to ``path`` as JSON, overwriting any existing file."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(key.to_dict(), f, indent=2)
         f.write("\n")
 
 
 def load_codec_key(path: str) -> CodecKey:
-    """Load a codec key from a JSON file.
-
-    The loaded key can be used with decode_text_to_data() to recover the original
-    payload from steganographic text.
-
-    Args:
-        path: Path to the JSON key file.
-
-    Returns:
-        A CodecKey instance with parameters loaded from the file.
+    """Read a codec key from a JSON file.
 
     Raises:
-        FileNotFoundError: If the key file doesn't exist.
-        ValueError: If the key file contains invalid or missing required fields.
-
-    Example:
-        >>> key = load_codec_key("my_key.json")
-        >>> decoded = decode_text_to_data(text, key, prompt, model, tokenizer, device)
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the file is not a readable key for this version.
     """
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
     return CodecKey.from_dict(raw)
 
 
+# --------------------------------------------------------------------------
+# model loading
+# --------------------------------------------------------------------------
+
+
 def set_deterministic(seed: int = 0) -> None:
-    """Configure PyTorch for deterministic operation.
+    """Seed torch and request deterministic, full-precision kernels.
 
-    Encoding and decoding must produce identical results given the same inputs.
-    This function seeds random number generators and configures PyTorch/cuDNN
-    to use deterministic algorithms.
+    Encoding and decoding must observe identical logits, so this pins the RNGs,
+    disables autotuning, and holds fp32 matmuls at full precision. Full CUDA
+    determinism additionally needs ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` in the
+    environment before torch is imported; importing :mod:`subtext_codec` sets
+    that default for you.
 
-    Note:
-        For full determinism with CUDA, also set the environment variable
-        CUBLAS_WORKSPACE_CONFIG=:4096:8 before importing torch.
-
-    Args:
-        seed: Random seed for reproducibility. Default is 0.
-
-    Example:
-        >>> set_deterministic(42)
-        >>> # Now encoding/decoding will be reproducible
+    Note that this mutates global torch state, including for code outside this
+    package. That is deliberate: a mismatch here costs the whole message.
     """
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    # TF32 is deterministic in itself, but whether it is enabled varies with the
+    # torch version and the GPU generation, and it carries only ~10 mantissa
+    # bits. A message encoded with it on will not decode where it is off, so pin
+    # it rather than inherit whatever the environment happens to default to.
+    torch.set_float32_matmul_precision("highest")
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+_DTYPES = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
 
 
 def _parse_torch_dtype(dtype: Optional[str]) -> Optional[Union[str, torch.dtype]]:
@@ -240,21 +279,12 @@ def _parse_torch_dtype(dtype: Optional[str]) -> Optional[Union[str, torch.dtype]
     lowered = dtype.lower()
     if lowered == "auto":
         return "auto"
-    mapping = {
-        "float16": torch.float16,
-        "fp16": torch.float16,
-        "half": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float32": torch.float32,
-        "fp32": torch.float32,
-    }
-    if lowered not in mapping:
+    if lowered not in _DTYPES:
         raise ValueError(
             "torch-dtype must be one of: auto, float16/fp16/half, "
             "bfloat16/bf16, float32/fp32"
         )
-    return mapping[lowered]
+    return _DTYPES[lowered]
 
 
 def load_model_and_tokenizer(
@@ -263,297 +293,231 @@ def load_model_and_tokenizer(
     torch_dtype: Optional[str] = None,
     seed: int = 0,
 ):
-    """Load a HuggingFace causal language model and tokenizer for encoding/decoding.
+    """Load a causal LM and its tokenizer in eval mode with deterministic settings.
 
-    This function loads the model in evaluation mode with deterministic settings.
-    The same model (including version and precision) must be used for both
-    encoding and decoding to ensure correct round-trip behavior.
-
-    Args:
-        model_name_or_path: HuggingFace model identifier (e.g., "meta-llama/Llama-3.1-8B")
-            or path to a local model directory.
-        device: Computation device ("cuda", "cpu", or specific like "cuda:0").
-        torch_dtype: Model precision. Options: "float16"/"fp16", "bfloat16"/"bf16",
-            "float32"/"fp32", or "auto". If None, uses the model's default dtype.
-        seed: Random seed for deterministic behavior. Default is 0.
+    The same checkpoint *and* the same dtype must be used for encoding and
+    decoding; changing either perturbs the logits enough to reorder candidates.
 
     Returns:
-        A tuple of (tokenizer, model) ready for use with encode/decode functions.
-
-    Raises:
-        ValueError: If torch_dtype is not a recognized precision string.
-
-    Note:
-        Loading large models requires significant memory. For Llama-3.1-8B with
-        bfloat16, expect ~16GB GPU memory usage.
-
-    Example:
-        >>> tokenizer, model = load_model_and_tokenizer(
-        ...     "meta-llama/Llama-3.1-8B-Instruct",
-        ...     device="cuda",
-        ...     torch_dtype="bf16"
-        ... )
+        ``(tokenizer, model)``.
     """
     set_deterministic(seed)
     resolved_dtype = _parse_torch_dtype(torch_dtype)
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
     model_kwargs = {}
     if resolved_dtype is not None:
-        model_kwargs["torch_dtype"] = resolved_dtype
+        # `torch_dtype` was renamed to `dtype` in transformers 4.56.
+        model_kwargs["dtype"] = resolved_dtype
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
     model.to(device)
     model.eval()
     return tokenizer, model
 
 
-def bytes_to_base_digits(data: bytes, base: int) -> List[int]:
-    """Convert bytes to a list of digits in the specified base.
+def _model_context_limit(model) -> Optional[int]:
+    config = getattr(model, "config", None)
+    for attr in ("max_position_embeddings", "n_positions", "n_ctx"):
+        value = getattr(config, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
 
-    Interprets the bytes as a big-endian unsigned integer, then converts
-    to the given base. Used internally for fixed-base (v1) encoding.
 
-    Args:
-        data: Binary data to convert.
-        base: The radix for conversion. Must be >= 2.
+def _resolve_context_limit(model, requested: Optional[int]) -> Optional[int]:
+    limits = [x for x in (requested, _model_context_limit(model)) if x is not None]
+    return min(limits) if limits else None
 
-    Returns:
-        A list of digits in the specified base, most significant first.
-        Returns an empty list for empty input.
 
-    Raises:
-        ValueError: If base < 2.
+# --------------------------------------------------------------------------
+# payload framing
+# --------------------------------------------------------------------------
 
-    Example:
-        >>> bytes_to_base_digits(b"\\x01\\x00", base=256)
-        [1, 0]
-        >>> bytes_to_base_digits(b"\\xff", base=16)
-        [15, 15]
+
+def _frame_payload(data: bytes) -> List[int]:
+    """Length and checksum, then the data, as a bitstream."""
+    return to_bits(_HEADER.pack(len(data), zlib.crc32(data)) + data)
+
+
+def _unframe_payload(bits: Sequence[int]) -> bytes:
+    """Inverse of :func:`_frame_payload`, with the header checked."""
+    if len(bits) < _HEADER_BITS:
+        raise ValueError(
+            "not enough data recovered to read the header; the message may be "
+            "truncated, or the key, prompt or model may not match the encoder"
+        )
+    length, checksum = _HEADER.unpack(from_bits(bits[:_HEADER_BITS]))
+    if length > MAX_PAYLOAD_BYTES:
+        raise ValueError(
+            f"decoded payload length ({length} bytes) is implausible; the key, "
+            "prompt or model almost certainly do not match the encoder"
+        )
+    needed = _HEADER_BITS + 8 * length
+    if len(bits) < needed:
+        raise ValueError(
+            f"message declares {length} bytes but only "
+            f"{(len(bits) - _HEADER_BITS) // 8} were recovered; it is truncated"
+        )
+    data = from_bits(bits[_HEADER_BITS:needed])
+    if zlib.crc32(data) != checksum:
+        raise ValueError(
+            "decoded payload failed its checksum; the message was altered, or "
+            "the key, prompt or model do not match the encoder"
+        )
+    return data
+
+
+def _declared_length(bits: Sequence[int]) -> Optional[int]:
+    """Total bits the message occupies, once the header is readable."""
+    if len(bits) < _HEADER_BITS:
+        return None
+    length, _ = _HEADER.unpack(from_bits(bits[:_HEADER_BITS]))
+    if length > MAX_PAYLOAD_BYTES:
+        raise ValueError(
+            f"decoded payload length ({length} bytes) is implausible; the key, "
+            "prompt or model almost certainly do not match the encoder"
+        )
+    return _HEADER_BITS + 8 * length
+
+
+# --------------------------------------------------------------------------
+# per-step distributions
+# --------------------------------------------------------------------------
+
+
+def _token_ids(tokenizer, text: str) -> List[int]:
+    return [int(i) for i in tokenizer(text)["input_ids"]]
+
+
+def _special_ids(tokenizer) -> frozenset:
+    return frozenset(int(i) for i in (getattr(tokenizer, "all_special_ids", None) or ()))
+
+
+def _stable_candidates(
+    tokenizer, context_ids: Sequence[int], candidates: Sequence[int]
+) -> List[int]:
+    """Keep only candidates that append cleanly to the text of ``context_ids``.
+
+    A candidate survives when writing out ``context + [candidate]`` and reading
+    it back yields exactly the previous tokenization plus that one token. This
+    rejects tokens that would merge with preceding characters, partial UTF-8
+    fragments, and special tokens that vanish when the text is written out --
+    each of which would make the decoder recover a different id stream than the
+    encoder chose.
+
+    Only the trailing ``SAFE_WINDOW`` tokens are examined. The comparison is
+    relative to the window's own re-tokenization, so it does not matter that
+    the window may start mid-word.
     """
-    if base < 2:
-        raise ValueError("base must be >= 2")
-    if len(data) == 0:
+    specials = _special_ids(tokenizer)
+    usable = [c for c in candidates if c not in specials]
+    if not usable:
         return []
-    n = int.from_bytes(data, byteorder="big", signed=False)
-    digits: List[int] = []
-    while n > 0:
-        n, rem = divmod(n, base)
-        digits.append(rem)
-    digits.reverse()
-    return digits
+
+    window = list(context_ids)[-SAFE_WINDOW:]
+    sequences = [window] + [window + [c] for c in usable]
+    texts = tokenizer.batch_decode(sequences, skip_special_tokens=True)
+    encodings = tokenizer(texts, add_special_tokens=False)["input_ids"]
+
+    base_text, base_ids = texts[0], [int(i) for i in encodings[0]]
+    width = len(base_ids)
+
+    stable: List[int] = []
+    for candidate, text, encoded in zip(usable, texts[1:], encodings[1:]):
+        ids = [int(i) for i in encoded]
+        if len(ids) != width + 1 or ids[width] != candidate or ids[:width] != base_ids:
+            continue
+        if not text.startswith(base_text) or len(text) == len(base_text):
+            continue
+        stable.append(candidate)
+    return stable
 
 
-def base_digits_to_bytes(
-    digits: Iterable[int], base: int, length: Optional[int] = None
-) -> bytes:
-    """Convert a list of base-N digits back to bytes.
-
-    This is the inverse of bytes_to_base_digits(). Used internally for
-    fixed-base (v1) decoding.
-
-    Args:
-        digits: Sequence of digits in the specified base, most significant first.
-        base: The radix of the digit representation. Must be >= 2.
-        length: If provided, pads/truncates the result to exactly this many bytes.
-            Required to correctly reconstruct payloads with leading zero bytes.
-
-    Returns:
-        The reconstructed bytes as a big-endian unsigned integer.
-
-    Raises:
-        ValueError: If base < 2 or any digit is out of range [0, base).
-        OverflowError: If length is specified but the value doesn't fit.
-
-    Example:
-        >>> base_digits_to_bytes([1, 0], base=256)
-        b'\\x01\\x00'
-        >>> base_digits_to_bytes([15, 15], base=16)
-        b'\\xff'
-        >>> base_digits_to_bytes([0], base=256, length=3)
-        b'\\x00\\x00\\x00'
-    """
-    if base < 2:
-        raise ValueError("base must be >= 2")
-    digit_list = list(digits)
-    n = 0
-    for d in digit_list:
-        if d < 0 or d >= base:
-            raise ValueError(f"digit {d} out of range for base {base}")
-        n = n * base + d
-    if length is not None:
-        if n == 0 and length == 0:
-            return b""
-        return n.to_bytes(length, byteorder="big", signed=False)
-    if n == 0:
-        return b"" if len(digit_list) == 0 else b"\x00"
-    length_bytes = (n.bit_length() + 7) // 8
-    return n.to_bytes(length_bytes, byteorder="big", signed=False)
-
-
-def _check_context_length(
-    input_ids: torch.Tensor, max_context_length: Optional[int]
-) -> None:
-    if max_context_length is not None and input_ids.shape[1] > max_context_length:
-        raise ValueError(
-            f"Context length {input_ids.shape[1]} exceeds max_context_length={max_context_length}"
-        )
-
-
-def _prepare_sorted_indices(logits: torch.Tensor, top_k: Optional[int]) -> torch.Tensor:
-    # Order tokens by descending likelihood and optionally clip to the allowed band
-    sorted_indices = torch.argsort(logits, descending=True)
-    if top_k is not None:
-        sorted_indices = sorted_indices[:top_k]
-    return sorted_indices
-
-
-def _select_rank_band(
-    logits: torch.Tensor, top_k: Optional[int], top_p: float, min_base: int = 2
-) -> Tuple[torch.Tensor, int]:
-    sorted_indices = torch.argsort(logits, descending=True)
-    if top_k is not None:
-        sorted_indices = sorted_indices[:top_k]
-
-    candidate_logits = logits[sorted_indices]
-    if candidate_logits.numel() < min_base:
-        raise ValueError(
-            f"Not enough candidate tokens ({candidate_logits.numel()}) to satisfy min_base={min_base}; "
-            "increase top_k or adjust prompt_prefix"
-        )
-
-    probs = torch.softmax(candidate_logits, dim=0)
-    cumulative = torch.cumsum(probs, dim=0)
-    cutoff = torch.searchsorted(
-        cumulative, torch.tensor(top_p, device=cumulative.device), right=True
-    )
-    base = int(cutoff.item()) + 1
-    base = max(min_base, min(base, candidate_logits.numel()))
-    return sorted_indices, base
-
-
-def mixed_radix_digits_to_bytes(
-    digits: Iterable[int], bases: Iterable[int], length: Optional[int] = None
-) -> bytes:
-    """Convert mixed-radix digits back to bytes.
-
-    In mixed-radix (variable-base) encoding, each position can have a different
-    base. This is used in v2 encoding where the base varies dynamically based
-    on the model's confidence at each token position.
-
-    The conversion treats the digit sequence as a mixed-radix number and
-    reconstructs the original integer value, then converts to bytes.
-
-    Args:
-        digits: Sequence of digits, one per position. Each digit[i] must be
-            in range [0, bases[i]).
-        bases: Sequence of bases corresponding to each digit position.
-            All bases must be >= 2.
-        length: If provided, pads/truncates the result to exactly this many bytes.
-            Required to correctly reconstruct payloads with leading zero bytes.
-
-    Returns:
-        The reconstructed bytes as a big-endian unsigned integer.
-
-    Raises:
-        ValueError: If digits and bases have different lengths, any base < 2,
-            or any digit is out of range for its corresponding base.
-        OverflowError: If length is specified but the value doesn't fit.
-
-    Example:
-        >>> mixed_radix_digits_to_bytes([1, 2, 3], [4, 5, 6])  # 1*(5*6) + 2*6 + 3
-        b'\\x2d'  # 45 in decimal
-    """
-    digit_list = list(digits)
-    base_list = list(bases)
-    if len(digit_list) != len(base_list):
-        raise ValueError("digits and bases must have the same length")
-    n = 0
-    for digit, base in zip(reversed(digit_list), reversed(base_list)):
-        if base < 2:
-            raise ValueError("All bases must be >= 2")
-        if digit < 0 or digit >= base:
-            raise ValueError(f"digit {digit} out of range for base {base}")
-        n = n * base + digit
-    if length is not None:
-        if n == 0 and length == 0:
-            return b""
-        return n.to_bytes(length, byteorder="big", signed=False)
-    if n == 0:
-        return b"" if len(digit_list) == 0 else b"\x00"
-    length_bytes = (n.bit_length() + 7) // 8
-    return n.to_bytes(length_bytes, byteorder="big", signed=False)
-
-
-def _encode_variable_base_digits(
-    data: bytes,
-    cfg: CodecConfig,
-    model,
+def _step_distribution(
+    logits: torch.Tensor,
+    context_ids: Sequence[int],
     tokenizer,
-) -> Tuple[torch.Tensor, CodecKey]:
-    try:
-        vocab_size = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
-    except TypeError as exc:
-        raise ValueError("tokenizer must provide vocab_size or __len__") from exc
-    if cfg.top_k is not None:
-        if cfg.top_k < 2:
-            raise ValueError("top_k must be >= 2 for variable-base encoding")
-        max_base = min(cfg.top_k, vocab_size)
-    else:
-        max_base = vocab_size
-    if max_base < 2:
-        raise ValueError("tokenizer must have at least 2 tokens in its vocabulary")
-
-    payload_bits = len(data) * 8
-
-    prompt_ids = tokenizer(cfg.prompt_prefix, return_tensors="pt").input_ids.to(
-        cfg.device
-    )
-    input_ids = prompt_ids
-    _check_context_length(input_ids, cfg.max_context_length)
-
-    remaining = int.from_bytes(data, byteorder="big", signed=False)
-    step = 0
-
-    while remaining > 0:
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits[:, -1, :].squeeze(0).cpu()
-
-        sorted_indices, base = _select_rank_band(logits, cfg.top_k, cfg.top_p)
-        digit = remaining % base
-        remaining //= base
-
-        next_token_id = sorted_indices[digit].unsqueeze(0).unsqueeze(0).to(cfg.device)
-        input_ids = torch.cat([input_ids, next_token_id], dim=1)
-        _check_context_length(input_ids, cfg.max_context_length)
-        step += 1
-
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids)
-        logits = outputs.logits[:, -1, :].squeeze(0).cpu()
-
-    sorted_indices, base = _select_rank_band(logits, cfg.top_k, cfg.top_p)
-    if base >= len(sorted_indices):
+    top_k: int,
+    temperature: float,
+) -> Tuple[List[int], List[int]]:
+    """Candidate tokens for one step and their cumulative frequency table."""
+    # float32 keeps the softmax well-conditioned for bf16/fp16 checkpoints, and
+    # a stable sort makes tie order a property of the token ids rather than of
+    # whichever sort kernel torch happens to dispatch to.
+    scores = logits.detach().to(torch.float32)
+    ranked = torch.argsort(scores, descending=True, stable=True)[:top_k].tolist()
+    alphabet = _stable_candidates(tokenizer, context_ids, ranked)
+    if len(alphabet) < MIN_ALPHABET:
         raise ValueError(
-            "Dynamic base exhausted the available candidate tokens; "
-            "lower top_p or raise top_k to leave room for a terminator"
+            f"only {len(alphabet)} of the top-{top_k} tokens are safe to emit here "
+            f"(need {MIN_ALPHABET}); raise top_k or choose a different prompt_prefix"
         )
-    terminator_token_id = sorted_indices[base].unsqueeze(0).unsqueeze(0).to(cfg.device)
-    input_ids = torch.cat([input_ids, terminator_token_id], dim=1)
-    _check_context_length(input_ids, cfg.max_context_length)
+    subset = scores[torch.tensor(alphabet, dtype=torch.long)] / temperature
+    probs = torch.softmax(subset.double(), dim=0)
+    return alphabet, cumulative(quantize_frequencies(probs))
 
-    key = CodecKey(
-        top_p=cfg.top_p,
-        top_k=cfg.top_k,
-        prompt_prefix=cfg.prompt_prefix,
-        model_name_or_path=cfg.model_name_or_path if cfg.store_model_in_key else None,
-        device=cfg.device,
-        torch_dtype=cfg.torch_dtype,
-        version="v2",
-        payload_length=len(data),
-    )
-    return input_ids, key
+
+class _Stepper:
+    """Incremental forward pass over a growing prefix, reusing the KV cache.
+
+    Encoding and decoding both drive this the same way -- prefill the prompt,
+    then feed one token at a time -- so the logits they observe at each step
+    are produced by identical work, which is what the codec's reversibility
+    depends on.
+    """
+
+    def __init__(self, model, device: str, prompt_ids: Sequence[int]):
+        if len(prompt_ids) == 0:
+            raise ValueError("prompt_prefix must tokenize to at least one token")
+        self._model = model
+        self._device = device
+        self._cache = None
+        self._logits: Optional[torch.Tensor] = None
+        self.length = 0
+        self._feed(list(prompt_ids))
+
+    def _feed(self, token_ids: List[int]) -> None:
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self._device)
+        with torch.no_grad():
+            outputs = self._model(
+                input_ids=input_ids, past_key_values=self._cache, use_cache=True
+            )
+        self._cache = outputs.past_key_values
+        self._logits = outputs.logits[0, -1, :].detach().to("cpu")
+        self.length += len(token_ids)
+
+    @property
+    def logits(self) -> torch.Tensor:
+        assert self._logits is not None
+        return self._logits
+
+    def advance(self, token_id: int) -> None:
+        self._feed([int(token_id)])
+
+
+def _check_limit(length: int, limit: Optional[int]) -> None:
+    if limit is not None and length > limit:
+        raise ValueError(
+            f"sequence length {length} exceeds the context limit {limit}; "
+            "shorten the payload or the prompt, or raise --max-context-length"
+        )
+
+
+# --------------------------------------------------------------------------
+# encoding
+# --------------------------------------------------------------------------
+
+
+def _verify_text_round_trip(tokenizer, text: str, ids: Sequence[int]) -> None:
+    actual = _token_ids(tokenizer, text)
+    if actual[: len(ids)] != list(ids):
+        divergence = next(
+            (i for i, (a, b) in enumerate(zip(actual, ids)) if a != b), len(ids)
+        )
+        raise ValueError(
+            "generated text does not tokenize back to the tokens it was built "
+            f"from (first difference at token {divergence}); this message would "
+            "not decode. Try a different prompt_prefix or a lower top_k"
+        )
 
 
 def encode_data_to_text(
@@ -561,141 +525,106 @@ def encode_data_to_text(
     cfg: CodecConfig,
     model,
     tokenizer,
+    progress: Optional[ProgressFn] = None,
 ) -> Tuple[str, CodecKey]:
-    """Encode binary data into steganographic text.
+    """Hide ``data`` inside text generated from ``cfg.prompt_prefix``.
 
-    This is the main encoding function. It takes arbitrary binary data and
-    produces natural-looking text that hides the data in token selection patterns.
-    The returned key is required to decode the message later.
-
-    The encoding process:
-    1. Converts the payload to a big-endian integer
-    2. Generates text token-by-token, selecting each token's rank to encode
-       a digit of the payload in a variable base determined by top_p/top_k
-    3. Appends a terminator token (at rank = base) to mark the end
-    4. Returns the full text including the prompt prefix
+    The framed payload drives an arithmetic decoder against the model's own
+    distribution, so each emitted token is drawn exactly as sampling at
+    ``cfg.temperature`` would draw it, and carries ``-log2(p)`` payload bits.
+    Generation stops as soon as the emitted tokens pin down every payload bit.
 
     Args:
-        data: Binary payload to hide in the generated text. Can be any bytes.
-        cfg: CodecConfig with model, device, prompt, and encoding parameters.
-        model: Pre-loaded HuggingFace causal language model (from load_model_and_tokenizer).
-        tokenizer: Corresponding tokenizer for the model.
+        data: Payload to hide. Any bytes, including empty.
+        cfg: Encoding parameters.
+        model: Causal LM from :func:`load_model_and_tokenizer`.
+        tokenizer: Its tokenizer.
+        progress: Optional ``progress(bits_written, bits_total)`` callback.
 
     Returns:
-        A tuple of (encoded_text, key) where:
-        - encoded_text: The steganographic text containing the hidden payload.
-          Starts with cfg.prompt_prefix followed by generated content.
-        - key: A CodecKey required for decoding. Save this securely!
+        ``(text, key)``. The text begins with ``cfg.prompt_prefix``; the key is
+        required to decode and should be kept as carefully as a password.
 
     Raises:
-        ValueError: If top_p is invalid, context length is exceeded, or the
-            model can't provide enough token candidates for encoding.
-
-    Example:
-        >>> config = CodecConfig(
-        ...     model_name_or_path="meta-llama/Llama-3.1-8B-Instruct",
-        ...     device="cuda",
-        ...     prompt_prefix="Here's a story: ",
-        ...     top_k=16,
-        ...     top_p=0.9
-        ... )
-        >>> text, key = encode_data_to_text(b"secret", config, model, tokenizer)
-        >>> save_codec_key(key, "key.json")
+        ValueError: If parameters are invalid, the payload does not fit within
+            the context or ``max_new_tokens``, too few candidates are safe to
+            emit, or the generated text does not tokenize back to itself.
     """
-    cfg_top_p = _validate_top_p(cfg.top_p)
-    cfg = dataclasses.replace(cfg, top_p=cfg_top_p)
-    input_ids, key = _encode_variable_base_digits(data, cfg, model, tokenizer)
-    full_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-    return full_text, key
+    temperature = _validate_temperature(cfg.temperature)
+    top_k = _validate_top_k(cfg.top_k)
+    limit = _resolve_context_limit(model, cfg.max_context_length)
 
+    payload_bits = _frame_payload(data)
+    total_bits = len(payload_bits)
 
-def _decode_fixed_base(
-    encoded_text: str,
-    key: CodecKey,
-    prompt_prefix: str,
-    model,
-    tokenizer,
-    device: str,
-    max_context_length: Optional[int],
-) -> bytes:
-    if key.base is None:
-        raise ValueError("codec key missing base for v1 decoding")
+    prompt_ids = _token_ids(tokenizer, cfg.prompt_prefix)
+    _check_limit(len(prompt_ids), limit)
 
-    body_ids = tokenizer(encoded_text, return_tensors="pt").input_ids.to(device)
-    prompt_ids = tokenizer(prompt_prefix, return_tensors="pt").input_ids.to(device)
+    stepper = _Stepper(model, cfg.device, prompt_ids)
+    ids = list(prompt_ids)
 
-    generated_ids = body_ids[:, prompt_ids.shape[1] :]
-    input_ids = prompt_ids.clone()
-    digits: List[int] = []
-    terminated = False
+    # The tail keeps the coder out of the degenerate all-zeros state that would
+    # otherwise cost the payload's last two bits; see arithmetic.ENCODER_TAIL.
+    reader = ArithmeticDecoder(payload_bits + ENCODER_TAIL)
+    # Re-encode as we go. Only bits the mirror has actually emitted are pinned
+    # down by the tokens so far, which makes this the correct stopping rule --
+    # and the check below turns any coder defect into a loud failure.
+    mirror = ArithmeticEncoder()
 
-    for next_token_id in generated_ids[0]:
-        _check_context_length(input_ids, max_context_length)
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits[:, -1, :].squeeze(0).cpu()
-        sorted_indices = _prepare_sorted_indices(logits, key.top_k)
-        positions = (sorted_indices == int(next_token_id)).nonzero(as_tuple=True)[0]
-        if len(positions) == 0:
+    generated = 0
+    stagnant = 0
+    while len(mirror.bits) < total_bits:
+        if cfg.max_new_tokens is not None and generated >= cfg.max_new_tokens:
             raise ValueError(
-                "Generated token not found in sorted indices; mismatched parameters?"
+                f"payload needs more than max_new_tokens={cfg.max_new_tokens} tokens; "
+                "raise it, raise the temperature, or shrink the payload"
             )
-        rank = int(positions.item())
-        if rank >= key.base:
-            terminated = True
-            break
-        digits.append(rank)
-        input_ids = torch.cat([input_ids, next_token_id.view(1, 1).to(device)], dim=1)
-
-    if not terminated:
-        raise ValueError("Termination token not found in encoded text")
-
-    return base_digits_to_bytes(digits, key.base, length=key.payload_length)
-
-
-def _decode_variable_base(
-    encoded_text: str,
-    key: CodecKey,
-    prompt_prefix: str,
-    model,
-    tokenizer,
-    device: str,
-    max_context_length: Optional[int],
-) -> bytes:
-    top_p = _validate_top_p(key.top_p)
-
-    body_ids = tokenizer(encoded_text, return_tensors="pt").input_ids.to(device)
-    prompt_ids = tokenizer(prompt_prefix, return_tensors="pt").input_ids.to(device)
-
-    generated_ids = body_ids[:, prompt_ids.shape[1] :]
-    input_ids = prompt_ids.clone()
-    digits: List[int] = []
-    bases: List[int] = []
-    terminated = False
-
-    for next_token_id in generated_ids[0]:
-        _check_context_length(input_ids, max_context_length)
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits[:, -1, :].squeeze(0).cpu()
-        sorted_indices, base = _select_rank_band(logits, key.top_k, top_p)
-        positions = (sorted_indices == int(next_token_id)).nonzero(as_tuple=True)[0]
-        if len(positions) == 0:
+        if stagnant >= _STALL_LIMIT:
             raise ValueError(
-                "Generated token not found in sorted indices; mismatched parameters?"
+                f"the arithmetic coder stopped making progress after {generated} "
+                f"tokens ({len(mirror.bits)}/{total_bits} bits)"
             )
-        rank = int(positions.item())
-        if rank >= base:
-            terminated = True
-            break
-        digits.append(rank)
-        bases.append(base)
-        input_ids = torch.cat([input_ids, next_token_id.view(1, 1).to(device)], dim=1)
 
-    if not terminated:
-        raise ValueError("Termination token not found in encoded text")
+        emitted = len(mirror.bits)
+        alphabet, cum = _step_distribution(
+            stepper.logits, ids, tokenizer, top_k, temperature
+        )
+        symbol = reader.decode(cum)
+        mirror.encode(symbol, cum)
 
-    return mixed_radix_digits_to_bytes(digits, bases, length=key.payload_length)
+        token = alphabet[symbol]
+        ids.append(token)
+        generated += 1
+        _check_limit(len(ids), limit)
+        stepper.advance(token)
+
+        stagnant = 0 if len(mirror.bits) > emitted else stagnant + 1
+        if progress is not None:
+            progress(min(len(mirror.bits), total_bits), total_bits)
+
+    if mirror.bits[:total_bits] != payload_bits:
+        raise ValueError(
+            "internal error: the arithmetic coder did not reproduce the payload; "
+            "refusing to emit a message that cannot be decoded"
+        )
+
+    text = tokenizer.decode(ids, skip_special_tokens=True)
+    _verify_text_round_trip(tokenizer, text, ids)
+
+    key = CodecKey(
+        top_k=top_k,
+        temperature=temperature,
+        prompt_prefix=cfg.prompt_prefix,
+        model_name_or_path=cfg.model_name_or_path if cfg.store_model_in_key else None,
+        device=cfg.device,
+        torch_dtype=cfg.torch_dtype,
+    )
+    return text, key
+
+
+# --------------------------------------------------------------------------
+# decoding
+# --------------------------------------------------------------------------
 
 
 def decode_text_to_data(
@@ -706,93 +635,96 @@ def decode_text_to_data(
     tokenizer,
     device: str,
     max_context_length: Optional[int] = None,
+    progress: Optional[ProgressFn] = None,
 ) -> bytes:
-    """Decode steganographic text back to the original binary payload.
+    """Recover the original payload from encoded text.
 
-    This is the main decoding function. Given encoded text and the corresponding
-    codec key, it recovers the exact original bytes that were hidden during encoding.
-
-    The decoding process:
-    1. Locates and strips the prompt prefix from the encoded text
-    2. Re-runs the model to reconstruct token probability distributions
-    3. Determines which rank was selected at each position to recover digits
-    4. Stops when the terminator token (rank >= base) is encountered
-    5. Converts the digit sequence back to bytes using payload_length from key
-
-    The decoder is robust to trailing text after the encoded message, since it
-    stops at the terminator token.
+    Replays the same per-step distributions the encoder saw and runs the
+    arithmetic encoder over the observed tokens, which reproduces the payload
+    bitstream. Reading stops as soon as the declared length has been recovered,
+    so text after the message is ignored, as is text before the prompt.
 
     Args:
-        encoded_text: The steganographic text to decode. Must contain the prompt
-            prefix followed by the encoded content.
-        key: CodecKey from the original encoding (from encode_data_to_text or
-            loaded via load_codec_key).
-        prompt_prefix: The prompt prefix used during encoding. Must match exactly.
-        model: Pre-loaded HuggingFace causal language model. Must be the same
-            model (including version and dtype) used for encoding.
-        tokenizer: Corresponding tokenizer for the model.
-        device: Computation device ("cuda", "cpu", etc.).
-        max_context_length: Optional context limit. If None, uses model default.
+        encoded_text: Text containing the encoded message.
+        key: Key produced at encode time.
+        prompt_prefix: Prompt used at encode time; must match exactly.
+        model: The same checkpoint, at the same precision, used to encode.
+        tokenizer: Its tokenizer.
+        device: Torch device string.
+        max_context_length: Optional cap on sequence length.
+        progress: Optional ``progress(tokens_read, tokens_total)`` callback.
 
     Returns:
-        The original binary payload, byte-for-byte identical to what was encoded.
+        The original payload, byte for byte.
 
     Raises:
-        ValueError: If the prompt prefix doesn't match, isn't found in the text,
-            the terminator token is missing, or parameters don't match encoding.
-
-    Example:
-        >>> key = load_codec_key("key.json")
-        >>> decoded = decode_text_to_data(
-        ...     encoded_text=message,
-        ...     key=key,
-        ...     prompt_prefix=key.prompt_prefix,
-        ...     model=model,
-        ...     tokenizer=tokenizer,
-        ...     device="cuda"
-        ... )
-        >>> assert decoded == original_secret
+        ValueError: If the prompt does not match or cannot be located, the
+            message is truncated, or the payload fails its checksum -- which is
+            what a wrong model, key or prompt looks like.
     """
+    if key.version != CODEC_VERSION:
+        raise ValueError(f"Unsupported codec key version: {key.version!r}")
     if key.prompt_prefix is not None and key.prompt_prefix != prompt_prefix:
         raise ValueError("Prompt prefix does not match codec key")
 
-    prefix_index = encoded_text.find(prompt_prefix)
-    if prefix_index == -1:
+    temperature = _validate_temperature(key.temperature)
+    top_k = _validate_top_k(key.top_k)
+    limit = _resolve_context_limit(model, max_context_length)
+
+    start = encoded_text.find(prompt_prefix)
+    if start == -1:
         raise ValueError("prompt_prefix not found in encoded_text")
-    encoded_text = encoded_text[prefix_index:]
 
-    if key.version == "v1":
-        return _decode_fixed_base(
-            encoded_text,
-            key=key,
-            prompt_prefix=prompt_prefix,
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            max_context_length=max_context_length,
+    ids = _token_ids(tokenizer, encoded_text[start:])
+    prompt_ids = _token_ids(tokenizer, prompt_prefix)
+    if ids[: len(prompt_ids)] != prompt_ids:
+        raise ValueError(
+            "the encoded text does not tokenize to the prompt_prefix followed by "
+            "the message; text preceding the prompt may have merged into it"
         )
+    body = ids[len(prompt_ids) :]
 
-    return _decode_variable_base(
-        encoded_text,
-        key=key,
-        prompt_prefix=prompt_prefix,
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_context_length=max_context_length,
-    )
+    stepper = _Stepper(model, device, prompt_ids)
+    context = list(prompt_ids)
+    writer = ArithmeticEncoder()
+    needed: Optional[int] = None
+
+    for index, token in enumerate(body):
+        if needed is not None and len(writer.bits) >= needed:
+            break
+        _check_limit(len(context) + 1, limit)
+
+        alphabet, cum = _step_distribution(
+            stepper.logits, context, tokenizer, top_k, temperature
+        )
+        # A token outside the candidate set means the stream has diverged --
+        # most often because trailing text merged into the final token. Stop and
+        # let the header and checksum judge what was recovered.
+        if token not in alphabet:
+            break
+
+        writer.encode(alphabet.index(token), cum)
+        context.append(token)
+        stepper.advance(token)
+
+        if needed is None:
+            needed = _declared_length(writer.bits)
+        if progress is not None:
+            progress(index + 1, len(body))
+
+    return _unframe_payload(writer.bits)
 
 
 __all__ = [
+    "CODEC_VERSION",
+    "DEFAULT_TEMPERATURE",
+    "DEFAULT_TOP_K",
     "CodecConfig",
     "CodecKey",
-    "set_deterministic",
-    "load_model_and_tokenizer",
-    "load_codec_key",
-    "save_codec_key",
-    "bytes_to_base_digits",
-    "base_digits_to_bytes",
-    "encode_data_to_text",
     "decode_text_to_data",
-    "mixed_radix_digits_to_bytes",
+    "encode_data_to_text",
+    "load_codec_key",
+    "load_model_and_tokenizer",
+    "save_codec_key",
+    "set_deterministic",
 ]

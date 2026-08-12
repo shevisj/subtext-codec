@@ -1,14 +1,48 @@
-name: "Publish"
+name: "CI/CD"
 
 on:
   push:
+    branches: [main]
     tags:
       # Publish on any tag starting with a `v`, e.g., v0.1.0
       - v*
+  pull_request:
+    branches: [main]
 
 jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install
+        # CPU wheels only; the tests never need a GPU.
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            torch transformers pytest
+          uv pip install --no-deps -e .
+      - name: Test
+        # Invoke the venv directly rather than via `uv run`, which may re-sync
+        # from PyPI and replace the CPU torch wheel with the CUDA one.
+        # The slow tests download a small checkpoint from the Hub; they skip
+        # themselves if it is unreachable.
+        run: .venv/bin/python -m pytest -q
+
   pypi-publish:
     name: Upload release to PyPI
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
       name: release
@@ -16,7 +50,7 @@ jobs:
     permissions:
       id-token: write  # IMPORTANT: this permission is mandatory for trusted publishing
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - name: Set up Python

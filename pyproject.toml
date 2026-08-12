@@ -4,19 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "subtext-codec"
-version = "0.1.3"
+version = "1.0.0"
 description = "Steganographic data encoding in LLM-generated text using logit rank steering."
 readme = "README.md"
 authors = [{ name = "Shevis Johnson" , email = "hello@shev.is" }]
 requires-python = ">=3.10"
 dependencies = [
-    "torch==2.9.1",
-    "torchvision==0.24.1",
-    "transformers==4.57.3",
+    # Lower bounds only. Pinning exact versions in a library makes it
+    # uninstallable alongside anything else that depends on torch; the codec
+    # only needs a working causal LM forward pass with a KV cache.
+    # transformers >= 4.56 is required for the `dtype=` argument to
+    # `from_pretrained` (`torch_dtype` is deprecated and removed in 5.x).
+    "torch>=2.1",
+    "transformers>=4.56",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=9.0"]
+test = ["pytest>=8.0"]
 
 [project.scripts]
 subtext-codec = "subtext_codec.cli:main"
@@ -32,10 +36,6 @@ packages = ["subtext_codec"]
 
 [tool.pytest.ini_options]
 markers = [
-    "slow: marks tests as slow (requiring network access or real models)",
+    "slow: requires downloading and running a real model",
 ]
 testpaths = ["tests"]
-
-[[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu130"

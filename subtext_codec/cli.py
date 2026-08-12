@@ -4,7 +4,10 @@ import sys
 from typing import List, Optional
 
 from .codec import (
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
     CodecConfig,
+    CodecKey,
     decode_text_to_data,
     encode_data_to_text,
     load_codec_key,
@@ -46,163 +49,251 @@ def _write_text(path: str, text: str) -> None:
             f.write(text)
 
 
+class _Progress:
+    """Single-line progress on stderr, so it never pollutes piped output."""
+
+    def __init__(self, label: str, enabled: bool):
+        self.label = label
+        self.enabled = enabled and sys.stderr.isatty()
+        self._last = -1
+
+    def __call__(self, done: int, total: Optional[int]) -> None:
+        if not self.enabled:
+            return
+        pct = int(100 * done / total) if total else 0
+        if pct == self._last:
+            return
+        self._last = pct
+        sys.stderr.write(f"\r{self.label}: {pct:3d}%")
+        sys.stderr.flush()
+
+    def done(self) -> None:
+        if self.enabled and self._last >= 0:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LLM logit-rank codec PoC")
+    parser = argparse.ArgumentParser(
+        prog="subtext-codec",
+        description=(
+            "Hide bytes inside LLM-generated text by arithmetic coding against "
+            "the model's own next-token distribution."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--model-name-or-path")
-    common.add_argument("--device")
-    common.add_argument("--prompt-prefix")
-    common.add_argument("--max-context-length", type=int, default=None)
-    common.add_argument("--seed", type=int, default=0)
+    common.add_argument(
+        "--model-name-or-path",
+        help="HuggingFace model id or local path to a causal LM",
+    )
+    common.add_argument("--device", help="torch device, e.g. cpu or cuda (default: cpu)")
+    common.add_argument(
+        "--prompt-prefix", help="prefix text; must be identical for encode and decode"
+    )
+    common.add_argument(
+        "--max-context-length",
+        type=int,
+        default=None,
+        help="cap on total sequence length (default: the model's own limit)",
+    )
+    common.add_argument("--seed", type=int, default=0, help="deterministic seed")
     common.add_argument(
         "--torch-dtype",
-        help="torch dtype for model weights (auto, float16/fp16/half, bfloat16/bf16, float32/fp32)",
+        help="model weight dtype (auto, float16/fp16/half, bfloat16/bf16, float32/fp32)",
     )
-
-    enc = subparsers.add_parser("encode", parents=[common])
-    enc.add_argument("--top-k", type=int, default=None)
-    enc.add_argument(
-        "--top-p",
-        type=float,
-        default=None,
-        help="Cumulative probability threshold for variable bases (0 < top-p <= 1)",
-    )
-    enc.add_argument("--input-bytes", required=True)
-    enc.add_argument("--output-text", required=True)
-    enc.add_argument(
+    common.add_argument(
         "--key",
         required=True,
-        help="Path to the codec key (loads existing values and writes updates)",
+        help="path to the codec key file",
+    )
+    common.add_argument(
+        "--quiet", action="store_true", help="suppress progress output on stderr"
+    )
+
+    enc = subparsers.add_parser(
+        "encode", parents=[common], help="hide bytes inside generated text"
     )
     enc.add_argument(
-        "--include-model-in-key",
+        "--top-k",
+        type=int,
+        default=None,
+        help=(
+            "candidates considered per step; bounds the stability filter's work "
+            f"rather than capacity (default: {DEFAULT_TOP_K})"
+        ),
+    )
+    enc.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help=(
+            "sampling temperature, and the capacity dial: higher packs more "
+            "payload per token but makes the cover text more erratic "
+            f"(default: {DEFAULT_TEMPERATURE})"
+        ),
+    )
+    enc.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="fail rather than generate more than this many tokens",
+    )
+    enc.add_argument("--input-bytes", required=True, help="payload file, or - for stdin")
+    enc.add_argument(
+        "--output-text", required=True, help="destination for the text, or - for stdout"
+    )
+    enc.add_argument(
+        "--no-store-model",
         action="store_true",
-        help="Store the model name in the generated key file",
+        help="keep the model id out of the key file",
+    )
+    enc.add_argument(
+        "--verify",
+        action="store_true",
+        help="decode the result before writing it, to confirm the round trip",
     )
 
-    dec = subparsers.add_parser("decode", parents=[common])
-    dec.add_argument("--input-text", required=True)
-    dec.add_argument("--output-bytes", required=True)
+    dec = subparsers.add_parser(
+        "decode", parents=[common], help="recover bytes from encoded text"
+    )
+    dec.add_argument("--input-text", required=True, help="encoded text, or - for stdin")
     dec.add_argument(
-        "--top-p",
-        type=float,
-        default=None,
-        help="Override top-p from the key (0 < top-p <= 1)",
+        "--output-bytes", required=True, help="destination for the payload, or - for stdout"
     )
     dec.add_argument(
-        "--key",
-        required=True,
-        help="Path to the codec key (loads existing values and writes updates)",
+        "--temperature",
+        type=float,
+        default=None,
+        help="override the key's temperature (it must match the encode run)",
     )
 
     return parser
 
 
-def run_encode(args) -> None:
-    key_from_input = load_codec_key(args.key) if os.path.exists(args.key) else None
+def _first(*values):
+    """First value that was actually supplied."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
-    model_name = args.model_name_or_path or (
-        key_from_input.model_name_or_path if key_from_input else None
+
+def run_encode(args) -> None:
+    existing = load_codec_key(args.key) if os.path.exists(args.key) else None
+
+    model_name = _first(
+        args.model_name_or_path, existing.model_name_or_path if existing else None
     )
     if model_name is None:
-        raise ValueError(
-            "model-name-or-path is required unless provided via --key"
-        )
+        raise ValueError("--model-name-or-path is required unless stored in --key")
 
-    prompt_prefix = args.prompt_prefix or (
-        key_from_input.prompt_prefix if key_from_input else None
+    prompt_prefix = _first(
+        args.prompt_prefix, existing.prompt_prefix if existing else None
     )
     if prompt_prefix is None:
-        raise ValueError("prompt-prefix is required unless provided via --key")
+        raise ValueError("--prompt-prefix is required unless stored in --key")
 
-    top_k = (
-        args.top_k
-        if args.top_k is not None
-        else key_from_input.top_k if key_from_input else None
+    top_k = _first(args.top_k, existing.top_k if existing else None, DEFAULT_TOP_K)
+    temperature = _first(
+        args.temperature,
+        existing.temperature if existing else None,
+        DEFAULT_TEMPERATURE,
     )
-    top_p = (
-        args.top_p
-        if args.top_p is not None
-        else key_from_input.top_p if key_from_input else None
-    )
-    if top_p is None:
-        top_p = 0.9
-    torch_dtype = (
-        args.torch_dtype
-        if args.torch_dtype is not None
-        else key_from_input.torch_dtype if key_from_input else None
-    )
-
-    device = (
-        args.device
-        if args.device is not None
-        else key_from_input.device if key_from_input else "cpu"
-    )
+    torch_dtype = _first(args.torch_dtype, existing.torch_dtype if existing else None)
+    device = _first(args.device, existing.device if existing else None, "cpu")
 
     set_deterministic(args.seed)
     tokenizer, model = load_model_and_tokenizer(
-        model_name, device, torch_dtype=torch_dtype
+        model_name, device, torch_dtype=torch_dtype, seed=args.seed
     )
+
     cfg = CodecConfig(
         model_name_or_path=model_name,
         device=device,
         prompt_prefix=prompt_prefix,
         max_context_length=args.max_context_length,
         top_k=top_k,
-        top_p=top_p,
+        temperature=temperature,
         torch_dtype=torch_dtype,
-        store_model_in_key=(
-            args.include_model_in_key
-            or (key_from_input is not None and key_from_input.model_name_or_path is not None)
-            or args.model_name_or_path is not None
-        ),
+        store_model_in_key=not args.no_store_model,
+        max_new_tokens=args.max_new_tokens,
     )
+
     payload = _read_bytes(args.input_bytes)
-    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    progress = _Progress("encoding", not args.quiet)
+    try:
+        text, key = encode_data_to_text(payload, cfg, model, tokenizer, progress=progress)
+    finally:
+        progress.done()
+
+    if args.verify:
+        check = _Progress("verifying", not args.quiet)
+        try:
+            recovered = decode_text_to_data(
+                text,
+                key=key,
+                prompt_prefix=prompt_prefix,
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                max_context_length=args.max_context_length,
+                progress=check,
+            )
+        finally:
+            check.done()
+        if recovered != payload:
+            raise ValueError("verification failed: the message did not round-trip")
+
     save_codec_key(key, args.key)
     _write_text(args.output_text, text)
 
 
 def run_decode(args) -> None:
     if not os.path.exists(args.key):
-        raise ValueError("--key file not found; create one during encode first")
+        raise ValueError(f"key file not found: {args.key}")
     key = load_codec_key(args.key)
 
-    model_name = args.model_name_or_path or key.model_name_or_path
+    model_name = _first(args.model_name_or_path, key.model_name_or_path)
     if model_name is None:
-        raise ValueError("model-name-or-path is required unless present in --key")
+        raise ValueError("--model-name-or-path is required unless present in --key")
 
-    prompt_prefix = args.prompt_prefix or key.prompt_prefix
+    prompt_prefix = _first(args.prompt_prefix, key.prompt_prefix)
     if prompt_prefix is None:
-        raise ValueError("prompt-prefix is required unless present in --key")
-    torch_dtype = args.torch_dtype or key.torch_dtype
-    device = args.device or key.device or "cpu"
-    top_p = args.top_p if args.top_p is not None else key.top_p
-    if key.version != "v1" and top_p is None:
-        raise ValueError("top-p is required unless present in --key for variable-base decoding")
+        raise ValueError("--prompt-prefix is required unless present in --key")
+
+    torch_dtype = _first(args.torch_dtype, key.torch_dtype)
+    device = _first(args.device, key.device, "cpu")
+    temperature = _first(args.temperature, key.temperature)
+    if temperature is None:
+        raise ValueError("--temperature is required unless present in --key")
 
     set_deterministic(args.seed)
     tokenizer, model = load_model_and_tokenizer(
-        model_name, device, torch_dtype=torch_dtype
+        model_name, device, torch_dtype=torch_dtype, seed=args.seed
     )
+
+    # Decoding never rewrites the key file; a read operation should not be able
+    # to damage the one artifact the message cannot be recovered without.
+    run_key = CodecKey(**{**vars(key), "temperature": temperature})
+
     encoded_text = _read_text(args.input_text)
-    key.top_p = top_p
-    data = decode_text_to_data(
-        encoded_text,
-        key=key,
-        prompt_prefix=prompt_prefix,
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_context_length=args.max_context_length,
-    )
-    key.model_name_or_path = model_name
-    key.prompt_prefix = prompt_prefix
-    key.device = device
-    key.torch_dtype = torch_dtype
-    save_codec_key(key, args.key)
+    progress = _Progress("decoding", not args.quiet)
+    try:
+        data = decode_text_to_data(
+            encoded_text,
+            key=run_key,
+            prompt_prefix=prompt_prefix,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            max_context_length=args.max_context_length,
+            progress=progress,
+        )
+    finally:
+        progress.done()
+
     _write_bytes(args.output_bytes, data)
 
 
@@ -217,7 +308,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             run_decode(args)
         else:
             parser.error("Unknown command")
-    except ValueError as exc:
+    except (ValueError, FileNotFoundError, OSError) as exc:
         parser.error(str(exc))
 
 

@@ -1,248 +1,206 @@
+"""Payload framing and codec key handling."""
+
 import json
-import os
+import zlib
 
 import pytest
 
 import subtext_codec
+from subtext_codec.arithmetic import to_bits
+from subtext_codec.codec import (
+    MAX_PAYLOAD_BYTES,
+    _declared_length,
+    _frame_payload,
+    _unframe_payload,
+)
 
 
-@pytest.mark.parametrize("base", [2, 4, 8, 16, 32])
-@pytest.mark.parametrize("length", [0, 1, 16, 128])
-def test_base_conversion_round_trip(base: int, length: int) -> None:
-    payload = os.urandom(length)
-    digits = subtext_codec.bytes_to_base_digits(payload, base)
-    recovered = subtext_codec.base_digits_to_bytes(digits, base)
-    assert recovered == payload.lstrip(b"\x00")
+# --------------------------------------------------------------------------
+# framing
+# --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("base", [2, 4, 8, 16, 32])
-@pytest.mark.parametrize("length", [0, 1, 16, 128])
-def test_base_conversion_with_exact_length(base: int, length: int) -> None:
-    """Test that base_digits_to_bytes correctly preserves length including leading zeros."""
-    payload = os.urandom(length)
-    digits = subtext_codec.bytes_to_base_digits(payload, base)
-    recovered = subtext_codec.base_digits_to_bytes(digits, base, length=length)
-    assert recovered == payload
+@pytest.mark.parametrize(
+    "payload",
+    [b"", b"\x00", b"\x00\x00\x00", b"hello", bytes(range(64)), b"\xff" * 300],
+)
+def test_framing_round_trip(payload):
+    """Framing is what keeps leading zeros and detects a mismatched key."""
+    assert _unframe_payload(_frame_payload(payload)) == payload
 
 
-@pytest.mark.slow
-def test_tiny_model_round_trip() -> None:
-    """Test encoding/decoding with a real (tiny) model.
+def test_framing_tolerates_trailing_bits():
+    """The decoder stops at the declared length; anything after is ignored."""
+    framed = _frame_payload(b"exact") + [1, 0, 1, 1, 0, 0, 1, 0] * 4
+    assert _unframe_payload(framed) == b"exact"
 
-    Note: This test may be flaky due to tokenizer round-trip issues.
-    The fake model tests provide better coverage of the codec logic.
-    """
-    try:
-        tokenizer, model = subtext_codec.load_model_and_tokenizer(
-            "sshleifer/tiny-gpt2", "cpu"
-        )
-    except (OSError, ModuleNotFoundError, RuntimeError) as exc:
-        pytest.skip(f"tiny model not available ({exc})")
 
-    subtext_codec.set_deterministic(0)
+def test_unframing_rejects_a_corrupted_payload():
+    framed = _frame_payload(b"tamper with me")
+    framed[-1] ^= 1
+    with pytest.raises(ValueError, match="checksum"):
+        _unframe_payload(framed)
 
-    cfg = subtext_codec.CodecConfig(
-        model_name_or_path="sshleifer/tiny-gpt2",
-        device="cpu",
-        prompt_prefix="The story begins ",
-        max_context_length=None,
+
+def test_unframing_rejects_a_truncated_message():
+    framed = _frame_payload(b"a longer payload here")
+    with pytest.raises(ValueError, match="truncated"):
+        _unframe_payload(framed[:-32])
+
+
+def test_unframing_rejects_a_missing_header():
+    with pytest.raises(ValueError, match="header"):
+        _unframe_payload([1, 0, 1])
+
+
+def test_unframing_rejects_an_implausible_length():
+    """A wrong key usually shows up as a nonsense length, not a crash."""
+    bogus = to_bits((MAX_PAYLOAD_BYTES + 1).to_bytes(4, "big") + b"\x00" * 4)
+    with pytest.raises(ValueError, match="implausible"):
+        _unframe_payload(bogus)
+
+
+def test_declared_length_needs_a_full_header():
+    assert _declared_length([1] * 10) is None
+    framed = _frame_payload(b"1234")
+    assert _declared_length(framed) == len(framed)
+
+
+def test_checksum_is_over_the_payload():
+    framed = _frame_payload(b"checked")
+    assert zlib.crc32(b"checked") != 0
+    assert _unframe_payload(framed) == b"checked"
+
+
+# --------------------------------------------------------------------------
+# codec keys
+# --------------------------------------------------------------------------
+
+
+def make_key(**overrides) -> subtext_codec.CodecKey:
+    params = dict(
         top_k=32,
-        top_p=0.7,
-        store_model_in_key=True,
-    )
-
-    payload = b"test"
-    try:
-        encoded, key = subtext_codec.encode_data_to_text(payload, cfg, model, tokenizer)
-    except ValueError as exc:
-        if "terminator" in str(exc).lower():
-            pytest.skip(f"Model configuration doesn't support terminator: {exc}")
-        raise
-
-    assert key.model_name_or_path == cfg.model_name_or_path
-    assert key.top_p == pytest.approx(cfg.top_p)
-    assert key.version == "v2"
-    assert key.payload_length == len(payload)
-
-    try:
-        decoded = subtext_codec.decode_text_to_data(
-            encoded,
-            key=key,
-            prompt_prefix=cfg.prompt_prefix,
-            model=model,
-            tokenizer=tokenizer,
-            device="cpu",
-            max_context_length=cfg.max_context_length,
-        )
-        assert decoded == payload
-    except ValueError as exc:
-        if "not found in sorted indices" in str(exc):
-            pytest.skip(f"Tokenizer round-trip issue: {exc}")
-        raise
-
-
-def test_codec_key_round_trip(tmp_path) -> None:
-    key = subtext_codec.CodecKey(
-        top_k=None,
-        top_p=0.85,
+        temperature=1.5,
         prompt_prefix="abc",
         model_name_or_path="gpt2",
         device="cpu",
-        version="v2",
     )
+    params.update(overrides)
+    return subtext_codec.CodecKey(**params)
+
+
+def test_codec_key_round_trip(tmp_path):
+    key = make_key()
     path = tmp_path / "key.json"
     subtext_codec.save_codec_key(key, path)
-    loaded = subtext_codec.load_codec_key(path)
-    assert loaded == key
+    assert subtext_codec.load_codec_key(path) == key
 
 
-def test_codec_key_with_payload_length(tmp_path) -> None:
-    """Test that payload_length is correctly serialized and loaded."""
-    key = subtext_codec.CodecKey(
-        top_k=16,
-        top_p=0.9,
-        prompt_prefix="test",
-        model_name_or_path="gpt2",
-        device="cpu",
-        version="v2",
-        payload_length=42,
-    )
+def test_codec_key_fields_on_disk(tmp_path):
     path = tmp_path / "key.json"
-    subtext_codec.save_codec_key(key, path)
-    loaded = subtext_codec.load_codec_key(path)
-    assert loaded.payload_length == 42
-    assert loaded == key
+    subtext_codec.save_codec_key(make_key(torch_dtype="bf16"), path)
 
-
-def test_mixed_radix_round_trip() -> None:
-    payload = b"\x01\x23"
-    n = int.from_bytes(payload, byteorder="big", signed=False)
-    bases = [3, 5, 7, 11]
-    digits = []
-    working = n
-    for base in bases:
-        digits.append(working % base)
-        working //= base
-    assert working == 0
-    recovered = subtext_codec.mixed_radix_digits_to_bytes(digits, bases)
-    assert recovered == payload.lstrip(b"\x00")
-
-
-def test_mixed_radix_with_exact_length() -> None:
-    """Test mixed_radix_digits_to_bytes with exact length parameter."""
-    payload = b"\x00\x01\x23"
-    n = int.from_bytes(payload, byteorder="big", signed=False)
-    bases = [3, 5, 7, 11]
-    digits = []
-    working = n
-    for base in bases:
-        digits.append(working % base)
-        working //= base
-    assert working == 0
-    recovered = subtext_codec.mixed_radix_digits_to_bytes(digits, bases, length=3)
-    assert recovered == payload
-
-
-def test_mixed_radix_with_leading_zeros() -> None:
-    """Test that leading zero bytes are preserved when length is specified."""
-    payload = b"\x00\x00\x00\x42"
-    n = int.from_bytes(payload, byteorder="big", signed=False)
-    bases = [5, 7, 11, 13]
-    digits = []
-    working = n
-    for base in bases:
-        digits.append(working % base)
-        working //= base
-    recovered = subtext_codec.mixed_radix_digits_to_bytes(digits, bases, length=4)
-    assert recovered == payload
-
-
-def test_codec_key_v1_loading(tmp_path) -> None:
-    raw = {
-        "version": "v1",
-        "base": 4,
-        "top_k": None,
+    assert json.loads(path.read_text()) == {
+        "version": subtext_codec.CODEC_VERSION,
+        "top_k": 32,
+        "temperature": 1.5,
         "prompt_prefix": "abc",
         "model_name_or_path": "gpt2",
         "device": "cpu",
+        "torch_dtype": "bf16",
     }
-    path = tmp_path / "legacy_key.json"
-    path.write_text(json.dumps(raw))
-    loaded = subtext_codec.load_codec_key(path)
-    assert loaded.version == "v1"
-    assert loaded.base == 4
 
 
-def test_codec_key_v1_with_payload_length(tmp_path) -> None:
-    """Test that v1 keys can also have payload_length."""
-    raw = {
-        "version": "v1",
-        "base": 4,
-        "top_k": 8,
-        "prompt_prefix": "abc",
-        "model_name_or_path": "gpt2",
-        "device": "cpu",
-        "payload_length": 100,
-    }
-    path = tmp_path / "legacy_key.json"
-    path.write_text(json.dumps(raw))
-    loaded = subtext_codec.load_codec_key(path)
-    assert loaded.version == "v1"
-    assert loaded.base == 4
-    assert loaded.payload_length == 100
+def test_codec_version_is_v1():
+    assert subtext_codec.CODEC_VERSION == "v1"
 
 
-def test_base_digits_to_bytes_invalid_digit() -> None:
-    """Test that invalid digits raise an error."""
-    with pytest.raises(ValueError, match="out of range"):
-        subtext_codec.base_digits_to_bytes([0, 5, 2], base=4)
+def test_key_without_temperature_cannot_be_serialized():
+    with pytest.raises(ValueError, match="temperature is required"):
+        make_key(temperature=None).to_dict()
 
 
-def test_mixed_radix_digits_to_bytes_invalid_digit() -> None:
-    """Test that invalid digits raise an error."""
-    with pytest.raises(ValueError, match="out of range"):
-        subtext_codec.mixed_radix_digits_to_bytes([0, 5, 2], bases=[4, 4, 4])
+@pytest.mark.parametrize("temperature", [0.0, -1.0, 25.0])
+def test_temperature_validation(temperature):
+    with pytest.raises(ValueError, match="temperature must be"):
+        subtext_codec.CodecKey.from_dict(
+            {
+                "version": subtext_codec.CODEC_VERSION,
+                "temperature": temperature,
+                "top_k": 32,
+            }
+        )
 
 
-def test_mixed_radix_digits_to_bytes_length_mismatch() -> None:
-    """Test that mismatched digits and bases raise an error."""
-    with pytest.raises(ValueError, match="same length"):
-        subtext_codec.mixed_radix_digits_to_bytes([0, 1, 2], bases=[4, 4])
+def test_missing_temperature_is_rejected():
+    with pytest.raises(ValueError, match="temperature missing"):
+        subtext_codec.CodecKey.from_dict(
+            {"version": subtext_codec.CODEC_VERSION, "top_k": 32}
+        )
 
 
-def test_empty_payload_conversion() -> None:
-    """Test that empty payloads are handled correctly."""
-    assert subtext_codec.bytes_to_base_digits(b"", base=4) == []
-    assert subtext_codec.base_digits_to_bytes([], base=4) == b""
-    assert subtext_codec.base_digits_to_bytes([], base=4, length=0) == b""
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        {"version": "v1", "base": 4, "top_k": 8, "prompt_prefix": "x"},
+        {"version": "v1", "top_p": 0.9, "top_k": 16, "prompt_prefix": "x"},
+    ],
+    ids=["old-v1-fixed-base", "old-v2-style-top-p"],
+)
+def test_pre_1_0_keys_are_named_not_just_rejected(legacy, tmp_path):
+    """Pre-1.0 also numbered a format "v1"; say so instead of failing obscurely."""
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(legacy))
+    with pytest.raises(ValueError, match="predates subtext-codec 1.0"):
+        subtext_codec.load_codec_key(path)
 
 
-def test_zero_only_payload() -> None:
-    """Test that payloads with only zero bytes work correctly with length."""
-    payload = b"\x00\x00\x00"
-    assert subtext_codec.base_digits_to_bytes([], base=4, length=3) == payload
-
-
-def test_top_p_validation() -> None:
-    """Test that invalid top_p values are rejected."""
-    with pytest.raises(ValueError, match="top_p must be"):
-        subtext_codec.CodecKey.from_dict({
-            "version": "v2",
-            "top_p": 0.0,
-            "top_k": 16,
-        })
-    with pytest.raises(ValueError, match="top_p must be"):
-        subtext_codec.CodecKey.from_dict({
-            "version": "v2",
-            "top_p": 1.5,
-            "top_k": 16,
-        })
-
-
-def test_unsupported_codec_version() -> None:
-    """Test that unsupported codec versions are rejected."""
+@pytest.mark.parametrize("version", [None, "v2", "v3", "v99", ""])
+def test_unknown_versions_are_rejected(version):
     with pytest.raises(ValueError, match="Unsupported codec key version"):
-        subtext_codec.CodecKey.from_dict({
-            "version": "v99",
-            "top_k": 16,
-        })
+        subtext_codec.CodecKey.from_dict(
+            {"version": version, "top_k": 32, "temperature": 1.5}
+        )
+
+
+def test_version_is_exposed():
+    assert isinstance(subtext_codec.__version__, str)
+    assert subtext_codec.__version__
+
+
+# --------------------------------------------------------------------------
+# surface area
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["bytes_to_base_digits", "base_digits_to_bytes", "mixed_radix_digits_to_bytes"],
+)
+def test_rank_coding_helpers_are_gone(name):
+    assert not hasattr(subtext_codec, name)
+
+
+@pytest.mark.parametrize("name", ["_band", "_Band", "_nucleus_size", "_digits_to_int"])
+def test_rank_coding_internals_are_gone(name):
+    from subtext_codec import codec
+
+    assert not hasattr(codec, name)
+
+
+def test_codec_key_has_no_rank_coding_fields():
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(subtext_codec.CodecKey)}
+    assert "top_p" not in fields
+    assert "base" not in fields
+    assert "payload_length" not in fields
+    assert fields == {
+        "top_k",
+        "temperature",
+        "prompt_prefix",
+        "model_name_or_path",
+        "device",
+        "torch_dtype",
+        "version",
+    }
