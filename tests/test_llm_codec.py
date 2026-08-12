@@ -115,6 +115,62 @@ def test_codec_version_is_v1():
     assert subtext_codec.CODEC_VERSION == "v1"
 
 
+def test_codec_version_v2_is_exposed():
+    assert subtext_codec.CODEC_VERSION_V2 == "v2"
+
+
+def test_v1_key_json_omits_v2_fields_for_backward_compatibility():
+    """A plain key must stay byte-identical to what 1.0 wrote."""
+    key = make_key()
+    assert key.version == "v1"
+    on_disk = key.to_dict()
+    assert "compression" not in on_disk
+    assert "window" not in on_disk
+
+
+def test_v2_key_round_trips_with_window(tmp_path):
+    key = make_key(version="v2", window=1024)
+    path = tmp_path / "key.json"
+    subtext_codec.save_codec_key(key, path)
+    loaded = subtext_codec.load_codec_key(path)
+    assert loaded == key
+    assert loaded.window == 1024
+    assert json.loads(path.read_text())["window"] == 1024
+
+
+def test_window_must_be_at_least_two():
+    with pytest.raises(ValueError, match="window must be at least"):
+        subtext_codec.CodecKey.from_dict(
+            {"version": "v2", "top_k": 32, "temperature": 1.5, "window": 1}
+        )
+
+
+def test_v2_key_round_trips_with_compression(tmp_path):
+    key = make_key(version="v2", compression="zlib")
+    path = tmp_path / "key.json"
+    subtext_codec.save_codec_key(key, path)
+    loaded = subtext_codec.load_codec_key(path)
+    assert loaded == key
+    assert loaded.version == "v2"
+    assert loaded.compression == "zlib"
+    assert json.loads(path.read_text())["compression"] == "zlib"
+
+
+def test_v2_version_is_accepted():
+    key = subtext_codec.CodecKey.from_dict(
+        {"version": "v2", "top_k": 32, "temperature": 1.5, "compression": "zlib"}
+    )
+    assert key.version == "v2"
+    assert key.compression == "zlib"
+
+
+def test_unsupported_compression_is_rejected():
+    with pytest.raises(ValueError, match="unsupported compression"):
+        subtext_codec.CodecKey.from_dict(
+            {"version": "v2", "top_k": 32, "temperature": 1.5, "compression": "lzma"}
+        )
+
+
 def test_key_without_temperature_cannot_be_serialized():
     with pytest.raises(ValueError, match="temperature is required"):
         make_key(temperature=None).to_dict()
@@ -155,7 +211,7 @@ def test_pre_1_0_keys_are_named_not_just_rejected(legacy, tmp_path):
         subtext_codec.load_codec_key(path)
 
 
-@pytest.mark.parametrize("version", [None, "v2", "v3", "v99", ""])
+@pytest.mark.parametrize("version", [None, "v3", "v99", ""])
 def test_unknown_versions_are_rejected(version):
     with pytest.raises(ValueError, match="Unsupported codec key version"):
         subtext_codec.CodecKey.from_dict(
@@ -203,4 +259,6 @@ def test_codec_key_has_no_rank_coding_fields():
         "device",
         "torch_dtype",
         "version",
+        "compression",
+        "window",
     }

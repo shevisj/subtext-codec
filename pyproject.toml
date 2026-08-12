@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "subtext-codec"
-version = "1.0.1"
+version = "1.1.0"
 description = "Steganographic data encoding in LLM-generated text via arithmetic coding against the model's own next-token distribution."
 readme = "README.md"
 authors = [{ name = "Shevis Johnson" , email = "hello@shev.is" }]

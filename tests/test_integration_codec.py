@@ -154,6 +154,189 @@ def test_model_name_withheld_when_not_stored(fake_components):
 
 
 # --------------------------------------------------------------------------
+# compression (v2)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"", b"a", b"hello world", b"\x00\x00\x00zeros", b"repeat " * 20],
+    ids=["empty", "single", "text", "leading-zeros", "compressible"],
+)
+def test_round_trip_compressed(payload, fake_components):
+    assert round_trip(payload, fake_components, compress=True) == payload
+
+
+def test_compression_records_v2_and_the_codec(fake_components):
+    tokenizer, model = fake_components
+    _, key = encode_data_to_text(
+        b"compress me", make_config(compress=True), model, tokenizer
+    )
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.compression == "zlib"
+
+
+def test_plain_message_stays_v1(fake_components):
+    tokenizer, model = fake_components
+    _, key = encode_data_to_text(b"plain", make_config(), model, tokenizer)
+    assert key.version == subtext_codec.CODEC_VERSION
+    assert key.compression is None
+
+
+def test_wrong_compression_flag_fails_to_decode(fake_components):
+    """A key that misdescribes compression must not return plausible garbage."""
+    tokenizer, model = fake_components
+    text, key = encode_data_to_text(
+        b"a real payload here", make_config(compress=True), model, tokenizer
+    )
+    key.compression = None  # claim it was never compressed
+    with pytest.raises(ValueError):
+        decode_text_to_data(
+            text, key=key, prompt_prefix=PROMPT, model=model,
+            tokenizer=tokenizer, device="cpu",
+        )
+
+
+# --------------------------------------------------------------------------
+# rolling context window (v2) -- automatic long-payload support
+# --------------------------------------------------------------------------
+
+
+def rolling_round_trip(payload, components, window, **overrides):
+    """Encode with a small context window (forcing resets) and decode back."""
+    tokenizer, model = components
+    cfg = make_config(max_context_length=window, **overrides)
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=cfg.prompt_prefix, model=model,
+        tokenizer=tokenizer, device="cpu", max_context_length=window,
+    )
+    return text, key, decoded
+
+
+@pytest.mark.parametrize("window", [24, 32, 48])
+@pytest.mark.parametrize(
+    "payload",
+    [b"\x00\x00\x00leading zeros here", bytes(range(48)), b"words " * 16],
+    ids=["leading-zeros", "binary", "text"],
+)
+def test_round_trip_rolls_over_a_small_window(window, payload, fake_components):
+    _, key, decoded = rolling_round_trip(payload, fake_components, window)
+    assert decoded == payload
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.window == window
+
+
+def test_rolling_produces_one_continuous_passage(fake_components):
+    """The whole point: no repeated prompt, one flowing text."""
+    payload = bytes(range(40))
+    text, key, decoded = rolling_round_trip(payload, fake_components, window=32)
+    assert decoded == payload
+    assert text.count(PROMPT) == 1  # the prompt appears once, not per segment
+    assert key.window == 32
+
+
+def test_reset_count_is_reported(fake_components):
+    tokenizer, model = fake_components
+    seen = []
+    encode_data_to_text(
+        bytes(range(60)), make_config(max_context_length=32), model, tokenizer,
+        report_stats=seen.append,
+    )
+    assert seen[0].resets >= 1
+
+
+def test_short_payload_never_rolls(fake_components):
+    """A message that fits one window stays v1, with no window recorded."""
+    tokenizer, model = fake_components
+    _, key = encode_data_to_text(b"short", make_config(), model, tokenizer)
+    assert key.version == subtext_codec.CODEC_VERSION
+    assert key.window is None
+
+
+def test_rolling_with_compression(fake_components):
+    payload = b"the quick brown fox jumps over the lazy dog. " * 6
+    _, key, decoded = rolling_round_trip(payload, fake_components, window=48, compress=True)
+    assert decoded == payload
+    assert key.compression == "zlib"
+    assert key.window == 48
+
+
+def test_rolling_decoder_ignores_surrounding_noise(fake_components):
+    tokenizer, model = fake_components
+    payload = bytes(range(40))
+    cfg = make_config(max_context_length=32)
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+
+    decoded = decode_text_to_data(
+        "noise. " + text + " trailing!",
+        key=key, prompt_prefix=PROMPT, model=model, tokenizer=tokenizer,
+        device="cpu", max_context_length=32,
+    )
+    assert decoded == payload
+
+
+def test_rolling_tamper_is_caught(fake_components):
+    tokenizer, model = fake_components
+    payload = bytes(range(40))
+    cfg = make_config(max_context_length=32)
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+
+    idx = text.find(PROMPT) + len(PROMPT)
+    tampered = text[:idx] + "zzz " + text[idx:]
+    with pytest.raises(ValueError):
+        decode_text_to_data(
+            tampered, key=key, prompt_prefix=PROMPT, model=model,
+            tokenizer=tokenizer, device="cpu", max_context_length=32,
+        )
+
+
+# Note: whether a *wrong* window is caught can only be exercised on a real
+# model. The fake model's logits depend on the last 8 tokens, and a reset keeps
+# the last 16, so resets are transparent to it and the window does not affect
+# the result. tests/test_real_model.py covers the wrong-window case.
+
+
+# --------------------------------------------------------------------------
+# encode statistics
+# --------------------------------------------------------------------------
+
+
+def test_encode_stats_are_reported(fake_components):
+    tokenizer, model = fake_components
+    seen = []
+    encode_data_to_text(
+        b"measure me please",
+        make_config(),
+        model,
+        tokenizer,
+        report_stats=seen.append,
+    )
+    assert len(seen) == 1
+    stats = seen[0]
+    assert isinstance(stats, subtext_codec.EncodeStats)
+    assert stats.payload_bytes == len(b"measure me please")
+    assert stats.stored_bytes == stats.payload_bytes  # not compressed
+    assert stats.resets == 0
+    assert not stats.compressed
+    assert stats.tokens > 0
+    assert stats.bits_per_token > 0
+    assert stats.mean_surprisal_bits > 0
+
+
+def test_compression_stats_show_the_stored_size(fake_components):
+    tokenizer, model = fake_components
+    seen = []
+    encode_data_to_text(
+        b"repeat " * 40, make_config(compress=True), model, tokenizer,
+        report_stats=seen.append,
+    )
+    stats = seen[0]
+    assert stats.compressed
+    assert stats.stored_bytes < stats.payload_bytes  # repetitive data compresses
+
+
+# --------------------------------------------------------------------------
 # the tokenizer-stability filter
 # --------------------------------------------------------------------------
 
@@ -230,7 +413,7 @@ def test_missing_prompt_in_text_is_rejected(fake_components):
         )
 
 
-@pytest.mark.parametrize("version", ["v2", "v3", "v99"])
+@pytest.mark.parametrize("version", ["v3", "v99", "v100"])
 def test_foreign_key_versions_are_refused(version, fake_components):
     tokenizer, model = fake_components
     text, key = encode_data_to_text(b"versioned", make_config(), model, tokenizer)
@@ -297,14 +480,27 @@ def test_max_new_tokens_is_enforced(fake_components):
         )
 
 
-def test_context_limit_is_enforced(fake_components):
+def test_small_context_rolls_instead_of_failing(fake_components):
+    """A payload that outgrows the context now rolls the window, not errors."""
     tokenizer, model = fake_components
-    with pytest.raises(ValueError, match="context limit"):
+    payload = b"far too long for twelve tokens"
+    text, key = encode_data_to_text(
+        payload, make_config(max_context_length=12), model, tokenizer
+    )
+    assert key.window == 12
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=PROMPT, model=model, tokenizer=tokenizer,
+        device="cpu", max_context_length=12,
+    )
+    assert decoded == payload
+
+
+def test_prompt_longer_than_window_is_rejected(fake_components):
+    tokenizer, model = fake_components
+    with pytest.raises(ValueError, match="context window"):
         encode_data_to_text(
-            b"far too long for twelve tokens",
-            make_config(max_context_length=12),
-            model,
-            tokenizer,
+            b"x", make_config(prompt_prefix="abc uvw", max_context_length=2),
+            model, tokenizer,
         )
 
 
@@ -471,6 +667,65 @@ def test_cli_reuses_stored_key_parameters(tmp_path, cli_with_fake_model):
         ]
     )
     assert second_out.read_bytes() == b"second payload"
+
+
+def test_cli_compress_round_trip(tmp_path, cli_with_fake_model):
+    payload = b"compress this over the cli " * 6
+    paths = run_cli_round_trip(tmp_path, payload, extra_encode=("--compress",))
+    assert paths["output"].read_bytes() == payload
+
+    key = subtext_codec.load_codec_key(paths["key"])
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.compression == "zlib"
+
+
+def test_cli_rolling_round_trip(tmp_path, cli_with_fake_model):
+    """A small context window forces the roll; the key carries the window, so
+    decode needs no extra flag."""
+    payload = bytes(range(50))
+    paths = run_cli_round_trip(
+        tmp_path, payload, extra_encode=("--max-context-length", "32")
+    )
+    assert paths["output"].read_bytes() == payload
+
+    key = subtext_codec.load_codec_key(paths["key"])
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.window == 32
+
+
+def test_cli_reused_key_keeps_compressing(tmp_path, cli_with_fake_model):
+    """A key that recorded compression compresses the next message too."""
+    paths = run_cli_round_trip(tmp_path, b"first message here", extra_encode=("--compress",))
+
+    second_in = tmp_path / "second_in.bin"
+    second_in.write_bytes(b"second message body")
+    second_text = tmp_path / "second.txt"
+    second_out = tmp_path / "second.bin"
+
+    cli.main([
+        "encode",
+        "--input-bytes", str(second_in),
+        "--output-text", str(second_text),
+        "--key", str(paths["key"]),
+    ])
+    assert subtext_codec.load_codec_key(paths["key"]).compression == "zlib"
+
+    cli.main([
+        "decode",
+        "--input-text", str(second_text),
+        "--output-bytes", str(second_out),
+        "--key", str(paths["key"]),
+    ])
+    assert second_out.read_bytes() == b"second message body"
+
+
+def test_cli_version_flag_prints_and_exits(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--version"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "subtext-codec" in out
+    assert subtext_codec.__version__ in out
 
 
 def test_cli_no_store_model(tmp_path, cli_with_fake_model):

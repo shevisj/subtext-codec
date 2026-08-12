@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import struct
 import zlib
 from typing import Callable, List, Optional, Sequence, Tuple, Union
@@ -48,8 +49,26 @@ from .arithmetic import (
     to_bits,
 )
 
-#: Wire format. Matches the 1.0 release; there is no other format.
+#: Classic wire format, matching the 1.0 release: a single generated segment
+#: whose body frames ``length || crc32 || data``. A message that needs neither
+#: compression nor chunking is written in this format, so it stays byte-for-byte
+#: readable by 1.0.
 CODEC_VERSION = "v1"
+
+#: Wire format added in 1.1 for the features 1.0 could not express: zlib
+#: compression (signalled by the key's ``compression`` field) and a rolling
+#: context window (signalled by the key's ``window`` field) that lets a payload
+#: outrun the model's context. A 1.0 reader rejects a ``v2`` key rather than
+#: mis-reading it, which is why the new features carry a new version.
+CODEC_VERSION_V2 = "v2"
+
+#: Versions this build can read. ``from_dict`` still distinguishes a genuine
+#: pre-1.0 rank-coding key (which also called itself ``v1``) from these.
+SUPPORTED_VERSIONS = frozenset({CODEC_VERSION, CODEC_VERSION_V2})
+
+#: Compression codecs the ``compression`` key field may name. ``None`` means the
+#: payload is stored verbatim, exactly as 1.0 did.
+_COMPRESSIONS = frozenset({"zlib"})
 
 #: Candidate cap used when a config leaves ``top_k`` unset.
 DEFAULT_TOP_K = 64
@@ -82,6 +101,41 @@ _HEADER_BITS = _HEADER.size * 8
 
 #: Called as ``progress(done, total)``; ``total`` is None when unknown.
 ProgressFn = Callable[[int, Optional[int]], None]
+
+
+@dataclasses.dataclass(frozen=True)
+class EncodeStats:
+    """What one encode produced, for reporting and capacity checks.
+
+    ``bits_per_token`` is the user-facing density (raw payload bits over cover
+    tokens). ``mean_surprisal_bits`` is the mean ``-log2(p)`` the coder actually
+    spent per emitted token; the two being close is the confirmation that the
+    coder is running at the distribution's entropy rather than leaving capacity
+    on the table. They differ slightly because framing and (with compression)
+    the transformed payload are what the coder encodes, not the raw bytes.
+
+    Attributes:
+        payload_bytes: Size of the original payload handed to the encoder.
+        stored_bytes: Bytes actually encoded, after optional compression.
+        tokens: Cover tokens generated (excludes the prompt).
+        resets: How many times the rolling context window reset; 0 means the
+            message fit in a single window.
+        compressed: Whether the payload was zlib-compressed.
+        bits_per_token: ``8 * payload_bytes / tokens`` (0 if no tokens).
+        mean_surprisal_bits: Mean ``-log2(p)`` over the emitted tokens.
+    """
+
+    payload_bytes: int
+    stored_bytes: int
+    tokens: int
+    resets: int
+    compressed: bool
+    bits_per_token: float
+    mean_surprisal_bits: float
+
+
+#: Called once when encoding finishes, with the run's :class:`EncodeStats`.
+StatsFn = Callable[[EncodeStats], None]
 
 
 # --------------------------------------------------------------------------
@@ -131,8 +185,13 @@ class CodecConfig:
             checkpoint's dtype.
         store_model_in_key: Persist the model id in the key so decoding does
             not have to restate it.
-        max_new_tokens: Optional ceiling on generated tokens; encoding raises
-            rather than running away if the payload does not fit.
+        max_new_tokens: Optional ceiling on generated tokens, applied per
+            segment; encoding raises rather than running away if a chunk does
+            not fit.
+        compress: zlib-compress the payload before encoding. Recorded in the
+            key so decoding reverses it. Makes the payload bits more uniform
+            (which the indistinguishability argument wants) and usually shortens
+            the cover text. Uses the ``v2`` wire format.
     """
 
     model_name_or_path: str
@@ -144,6 +203,7 @@ class CodecConfig:
     torch_dtype: Optional[str] = None
     store_model_in_key: bool = False
     max_new_tokens: Optional[int] = None
+    compress: bool = False
 
 
 @dataclasses.dataclass
@@ -158,7 +218,15 @@ class CodecKey:
         device: Device used at encode time, reused as a decode default.
         torch_dtype: Precision used at encode time. Decoding in a different
             precision changes the logits and will not round-trip.
-        version: Wire format; always ``CODEC_VERSION``.
+        version: Wire format, ``CODEC_VERSION`` (``v1``) or ``CODEC_VERSION_V2``
+            (``v2``). ``v2`` is written only when compression or chunking is
+            used, so a plain message stays readable by 1.0.
+        compression: Codec applied to the payload before encoding, or ``None``.
+            Only ``"zlib"`` is defined. A ``v1`` key never sets it.
+        window: Rolling context size, in tokens, if the message was long enough
+            to reset the context; ``None`` if it fit in one window (the common
+            case, and always so for ``v1``). Decoding must reset at the same
+            size, so it is carried in the key rather than recomputed.
     """
 
     top_k: Optional[int]
@@ -168,11 +236,13 @@ class CodecKey:
     device: Optional[str] = None
     torch_dtype: Optional[str] = None
     version: str = CODEC_VERSION
+    compression: Optional[str] = None
+    window: Optional[int] = None
 
     def to_dict(self) -> dict:
         if self.temperature is None:
             raise ValueError("temperature is required to serialize a codec key")
-        return {
+        data = {
             "version": self.version,
             "top_k": self.top_k,
             "temperature": self.temperature,
@@ -181,11 +251,18 @@ class CodecKey:
             "device": self.device,
             "torch_dtype": self.torch_dtype,
         }
+        # Keep a v1 key byte-for-byte identical to what 1.0 wrote: the v2-only
+        # fields appear only when they are actually in use.
+        if self.compression is not None:
+            data["compression"] = self.compression
+        if self.window is not None:
+            data["window"] = self.window
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "CodecKey":
         version = data.get("version")
-        if version != CODEC_VERSION:
+        if version not in SUPPORTED_VERSIONS:
             raise ValueError(f"Unsupported codec key version: {version!r}")
         # Pre-1.0 releases also numbered a format "v1", but it was rank coding
         # and carried `base`/`top_p` instead of a temperature. Name that case
@@ -202,6 +279,15 @@ class CodecKey:
             raise ValueError("temperature missing from codec key")
         top_k_raw = data.get("top_k")
 
+        compression = data.get("compression")
+        if compression is not None and compression not in _COMPRESSIONS:
+            raise ValueError(f"unsupported compression: {compression!r}")
+
+        window_raw = data.get("window")
+        window = None if window_raw is None else int(window_raw)
+        if window is not None and window < 2:
+            raise ValueError(f"window must be at least 2 tokens, got {window}")
+
         return cls(
             top_k=None if top_k_raw is None else int(top_k_raw),
             temperature=_validate_temperature(float(temperature)),
@@ -210,6 +296,8 @@ class CodecKey:
             device=data.get("device"),
             torch_dtype=data.get("torch_dtype"),
             version=version,
+            compression=compression,
+            window=window,
         )
 
 
@@ -463,17 +551,39 @@ class _Stepper:
     then feed one token at a time -- so the logits they observe at each step
     are produced by identical work, which is what the codec's reversibility
     depends on.
+
+    With a ``window`` the context is a rolling one: when it would exceed
+    ``window`` tokens, the last ``window // 2`` tokens are re-prefilled from a
+    fresh cache and generation continues from there. This is what lets a payload
+    outrun the model's context window -- the text stays one continuous passage,
+    conditioned on a sliding window of recent tokens rather than a re-inserted
+    prompt. The reset is driven purely by token count, so encode and decode
+    reset at the same steps and observe the same logits. ``window=None`` keeps
+    the full context, which is the 1.0 behaviour.
     """
 
-    def __init__(self, model, device: str, prompt_ids: Sequence[int]):
+    def __init__(
+        self, model, device: str, prompt_ids: Sequence[int], window: Optional[int] = None
+    ):
         if len(prompt_ids) == 0:
             raise ValueError("prompt_prefix must tokenize to at least one token")
+        if window is not None and len(prompt_ids) > window:
+            raise ValueError(
+                f"prompt_prefix is {len(prompt_ids)} tokens but the context window "
+                f"is {window}; shorten the prompt or raise --max-context-length"
+            )
         self._model = model
         self._device = device
+        self._window = window
+        self._carryover = max(1, window // 2) if window else None
         self._cache = None
         self._logits: Optional[torch.Tensor] = None
         self.length = 0
-        self._feed(list(prompt_ids))
+        #: Recent token ids kept for a context reset; bounded by the carryover.
+        self._recent: List[int] = []
+        #: How many times the context has been reset; 0 means it never rolled.
+        self.resets = 0
+        self._prefill(list(prompt_ids))
 
     def _feed(self, token_ids: List[int]) -> None:
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self._device)
@@ -483,7 +593,15 @@ class _Stepper:
             )
         self._cache = outputs.past_key_values
         self._logits = outputs.logits[0, -1, :].detach().to("cpu")
-        self.length += len(token_ids)
+
+    def _prefill(self, token_ids: List[int]) -> None:
+        """Fresh forward pass over ``token_ids`` from an empty cache."""
+        self._cache = None
+        self._feed(token_ids)
+        self.length = len(token_ids)
+        self._recent = (
+            token_ids[-self._carryover:] if self._carryover else list(token_ids)
+        )
 
     @property
     def logits(self) -> torch.Tensor:
@@ -491,7 +609,20 @@ class _Stepper:
         return self._logits
 
     def advance(self, token_id: int) -> None:
-        self._feed([int(token_id)])
+        token_id = int(token_id)
+        if self._window is not None and self.length + 1 > self._window:
+            # Re-prefill the most recent carryover tokens and roll forward. The
+            # logits from that prefill are discarded; the token below is what we
+            # actually need a distribution after.
+            keep = list(self._recent[-self._carryover:])
+            self._prefill(keep)
+            self.resets += 1
+        self._feed([token_id])
+        self.length += 1
+        if self._carryover:
+            self._recent = (self._recent + [token_id])[-self._carryover:]
+        else:
+            self._recent.append(token_id)
 
 
 def _check_limit(length: int, limit: Optional[int]) -> None:
@@ -520,12 +651,61 @@ def _verify_text_round_trip(tokenizer, text: str, ids: Sequence[int]) -> None:
         )
 
 
+def _frame_compressed(data: bytes) -> List[int]:
+    """Frame ``data`` for compressed transport: ``len(zlib) || crc32(data) || zlib``.
+
+    The length is over the compressed bytes (so the decoder knows when to stop),
+    but the CRC is over the *original* bytes. That is what catches a key whose
+    ``compression`` field is wrong in either direction: a compressed message read
+    as plain fails the CRC over the compressed bytes, and a plain message read as
+    compressed fails to decompress.
+    """
+    stored = zlib.compress(data, 9)
+    return to_bits(_HEADER.pack(len(stored), zlib.crc32(data)) + stored)
+
+
+def _unframe_compressed(bits: Sequence[int]) -> bytes:
+    """Inverse of :func:`_frame_compressed`, with the original-data CRC checked."""
+    if len(bits) < _HEADER_BITS:
+        raise ValueError(
+            "not enough data recovered to read the header; the message may be "
+            "truncated, or the key, prompt or model may not match the encoder"
+        )
+    length, checksum = _HEADER.unpack(from_bits(bits[:_HEADER_BITS]))
+    if length > MAX_PAYLOAD_BYTES:
+        raise ValueError(
+            f"decoded payload length ({length} bytes) is implausible; the key, "
+            "prompt or model almost certainly do not match the encoder"
+        )
+    needed = _HEADER_BITS + 8 * length
+    if len(bits) < needed:
+        raise ValueError(
+            f"message declares {length} compressed bytes but only "
+            f"{(len(bits) - _HEADER_BITS) // 8} were recovered; it is truncated"
+        )
+    stored = from_bits(bits[_HEADER_BITS:needed])
+    try:
+        data = zlib.decompress(stored)
+    except zlib.error as exc:
+        raise ValueError(
+            "failed to decompress the recovered payload; the key, prompt or model "
+            "do not match the encoder"
+        ) from exc
+    if zlib.crc32(data) != checksum:
+        raise ValueError(
+            "decoded payload failed its checksum; the message was altered, or the "
+            "key, prompt or model do not match the encoder"
+        )
+    return data
+
+
 def encode_data_to_text(
     data: bytes,
     cfg: CodecConfig,
     model,
     tokenizer,
     progress: Optional[ProgressFn] = None,
+    report_stats: Optional[StatsFn] = None,
 ) -> Tuple[str, CodecKey]:
     """Hide ``data`` inside text generated from ``cfg.prompt_prefix``.
 
@@ -534,12 +714,20 @@ def encode_data_to_text(
     ``cfg.temperature`` would draw it, and carries ``-log2(p)`` payload bits.
     Generation stops as soon as the emitted tokens pin down every payload bit.
 
+    ``cfg.compress`` zlib-compresses the payload first. A payload too long for
+    one context window is handled automatically by a rolling window: when the
+    context fills, the last half is re-prefixed and generation continues, so the
+    text stays one flowing passage with no repeated prompt. Either feature uses
+    the ``v2`` wire format (recorded in the key); a plain message that fits one
+    window stays ``v1`` and byte-compatible with 1.0.
+
     Args:
         data: Payload to hide. Any bytes, including empty.
         cfg: Encoding parameters.
         model: Causal LM from :func:`load_model_and_tokenizer`.
         tokenizer: Its tokenizer.
         progress: Optional ``progress(bits_written, bits_total)`` callback.
+        report_stats: Optional callback invoked once with an :class:`EncodeStats`.
 
     Returns:
         ``(text, key)``. The text begins with ``cfg.prompt_prefix``; the key is
@@ -547,8 +735,8 @@ def encode_data_to_text(
 
     Raises:
         ValueError: If parameters are invalid, the payload does not fit within
-            the context or ``max_new_tokens``, too few candidates are safe to
-            emit, or the generated text does not tokenize back to itself.
+            ``max_new_tokens``, too few candidates are safe to emit, or the
+            generated text does not tokenize back to itself.
     """
     temperature = _validate_temperature(cfg.temperature)
     top_k = _validate_top_k(cfg.top_k)
@@ -563,13 +751,21 @@ def encode_data_to_text(
             "(a larger message could not be decoded)"
         )
 
-    payload_bits = _frame_payload(data)
+    compressed = bool(cfg.compress)
+    if compressed:
+        payload_bits = _frame_compressed(data)
+        stored_bytes = zlib.compress(data, 9)  # for the stats line only
+    else:
+        payload_bits = _frame_payload(data)
+        stored_bytes = data
     total_bits = len(payload_bits)
 
     prompt_ids = _token_ids(tokenizer, cfg.prompt_prefix)
-    _check_limit(len(prompt_ids), limit)
-
-    stepper = _Stepper(model, cfg.device, prompt_ids)
+    # The window is the model's context limit; the stepper resets at it so a
+    # long payload keeps flowing. None (no known limit) means a single full
+    # context, which raises below if the payload outgrows it.
+    window = limit
+    stepper = _Stepper(model, cfg.device, prompt_ids, window=window)
     ids = list(prompt_ids)
 
     # The tail keeps the coder out of the degenerate all-zeros state that would
@@ -582,6 +778,7 @@ def encode_data_to_text(
 
     generated = 0
     stagnant = 0
+    surprisal = 0.0
     while len(mirror.bits) < total_bits:
         if cfg.max_new_tokens is not None and generated >= cfg.max_new_tokens:
             raise ValueError(
@@ -600,11 +797,13 @@ def encode_data_to_text(
         )
         symbol = reader.decode(cum)
         mirror.encode(symbol, cum)
+        surprisal += -math.log2((cum[symbol + 1] - cum[symbol]) / FREQ_TOTAL)
 
         token = alphabet[symbol]
         ids.append(token)
         generated += 1
-        _check_limit(len(ids), limit)
+        if window is None:
+            _check_limit(len(ids), limit)
         stepper.advance(token)
 
         stagnant = 0 if len(mirror.bits) > emitted else stagnant + 1
@@ -620,6 +819,7 @@ def encode_data_to_text(
     text = tokenizer.decode(ids, skip_special_tokens=True)
     _verify_text_round_trip(tokenizer, text, ids)
 
+    rolled = stepper.resets > 0
     key = CodecKey(
         top_k=top_k,
         temperature=temperature,
@@ -627,7 +827,23 @@ def encode_data_to_text(
         model_name_or_path=cfg.model_name_or_path if cfg.store_model_in_key else None,
         device=cfg.device,
         torch_dtype=cfg.torch_dtype,
+        version=CODEC_VERSION_V2 if (compressed or rolled) else CODEC_VERSION,
+        compression="zlib" if compressed else None,
+        window=window if rolled else None,
     )
+
+    if report_stats is not None:
+        report_stats(
+            EncodeStats(
+                payload_bytes=len(data),
+                stored_bytes=len(stored_bytes),
+                tokens=generated,
+                resets=stepper.resets,
+                compressed=compressed,
+                bits_per_token=(8 * len(data) / generated) if generated else 0.0,
+                mean_surprisal_bits=(surprisal / generated) if generated else 0.0,
+            )
+        )
     return text, key
 
 
@@ -651,7 +867,9 @@ def decode_text_to_data(
     Replays the same per-step distributions the encoder saw and runs the
     arithmetic encoder over the observed tokens, which reproduces the payload
     bitstream. Reading stops as soon as the declared length has been recovered,
-    so text after the message is ignored, as is text before the prompt.
+    so text after the message is ignored, as is text before the prompt. If the
+    key records a rolling ``window``, the context is reset at the same points
+    the encoder used, so a long message decodes exactly as it was written.
 
     Args:
         encoded_text: Text containing the encoded message.
@@ -671,29 +889,32 @@ def decode_text_to_data(
             message is truncated, or the payload fails its checksum -- which is
             what a wrong model, key or prompt looks like.
     """
-    if key.version != CODEC_VERSION:
+    if key.version not in SUPPORTED_VERSIONS:
         raise ValueError(f"Unsupported codec key version: {key.version!r}")
     if key.prompt_prefix is not None and key.prompt_prefix != prompt_prefix:
         raise ValueError("Prompt prefix does not match codec key")
 
     temperature = _validate_temperature(key.temperature)
     top_k = _validate_top_k(key.top_k)
-    limit = _resolve_context_limit(model, max_context_length)
+    prompt_ids = _token_ids(tokenizer, prompt_prefix)
 
     start = encoded_text.find(prompt_prefix)
     if start == -1:
         raise ValueError("prompt_prefix not found in encoded_text")
 
     ids = _token_ids(tokenizer, encoded_text[start:])
-    prompt_ids = _token_ids(tokenizer, prompt_prefix)
     if ids[: len(prompt_ids)] != prompt_ids:
         raise ValueError(
             "the encoded text does not tokenize to the prompt_prefix followed by "
             "the message; text preceding the prompt may have merged into it"
         )
-    body = ids[len(prompt_ids) :]
+    body = ids[len(prompt_ids):]
+    total_tokens = max(len(body), 1)
 
-    stepper = _Stepper(model, device, prompt_ids)
+    # The key's window is what the encoder rolled at; None means it never did.
+    # The stepper tracks the (rolling) model context; `context` is the full
+    # token history the stability filter needs, exactly as encode kept it.
+    stepper = _Stepper(model, device, prompt_ids, window=key.window)
     context = list(prompt_ids)
     writer = ArithmeticEncoder()
     needed: Optional[int] = None
@@ -701,8 +922,6 @@ def decode_text_to_data(
     for index, token in enumerate(body):
         if needed is not None and len(writer.bits) >= needed:
             break
-        _check_limit(len(context) + 1, limit)
-
         alphabet, cum = _step_distribution(
             stepper.logits, context, tokenizer, top_k, temperature
         )
@@ -719,17 +938,24 @@ def decode_text_to_data(
         if needed is None:
             needed = _declared_length(writer.bits)
         if progress is not None:
-            progress(index + 1, len(body))
+            progress(index + 1, total_tokens)
 
+    if key.compression == "zlib":
+        return _unframe_compressed(writer.bits)
+    if key.compression is not None:
+        raise ValueError(f"unsupported compression: {key.compression!r}")
     return _unframe_payload(writer.bits)
 
 
 __all__ = [
     "CODEC_VERSION",
+    "CODEC_VERSION_V2",
     "DEFAULT_TEMPERATURE",
     "DEFAULT_TOP_K",
+    "SUPPORTED_VERSIONS",
     "CodecConfig",
     "CodecKey",
+    "EncodeStats",
     "decode_text_to_data",
     "encode_data_to_text",
     "load_codec_key",
