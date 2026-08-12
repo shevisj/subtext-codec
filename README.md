@@ -183,7 +183,7 @@ For reference, the rank-coding scheme this replaced in 1.0 managed 4.35 bits/tok
 
 ## Determinism and devices
 
-The codec reduces to one requirement: encode and decode must derive the same frequency table at every step, down to the last integer. Everything after the forward pass -- the sort, the quantization, the stability filter -- runs on **CPU in float64 no matter where the model lives**, so the only device-sensitive component is the logits themselves. Encode and decode also drive the model identically (prefill the prompt, then one token at a time), so they hit the same kernels at the same shapes.
+The codec reduces to one requirement: encode and decode must derive the same frequency table at every step, down to the last integer. Everything after the forward pass runs **on CPU no matter where the model lives**: the logits are cast to float32 for the stable sort and the candidate filter, then to float64 for the softmax and quantization. So the only device-sensitive component is the logits themselves. Encode and decode also drive the model identically (prefill the prompt, then one token at a time), so they hit the same kernels at the same shapes.
 
 This has been measured, not just reasoned about. On an RTX 5090 (Blackwell, `sm_120`, torch 2.13 + CUDA 13), repeated passes over the same tokens produce **bit-identical** logits in fp32, bf16 and fp16, and all three round-trip on GPU. GPU is as reliable as CPU.
 

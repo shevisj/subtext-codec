@@ -554,6 +554,15 @@ def encode_data_to_text(
     top_k = _validate_top_k(cfg.top_k)
     limit = _resolve_context_limit(model, cfg.max_context_length)
 
+    # A payload past this size frames a length the decoder rejects as
+    # implausible, so refuse it here rather than emit a message that cannot be
+    # decoded -- the same ceiling _unframe_payload enforces on the way back.
+    if len(data) > MAX_PAYLOAD_BYTES:
+        raise ValueError(
+            f"payload is {len(data)} bytes; the maximum is {MAX_PAYLOAD_BYTES} "
+            "(a larger message could not be decoded)"
+        )
+
     payload_bits = _frame_payload(data)
     total_bits = len(payload_bits)
 

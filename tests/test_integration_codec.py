@@ -7,7 +7,7 @@ import torch
 
 import subtext_codec
 from subtext_codec import CodecConfig, cli, decode_text_to_data, encode_data_to_text
-from subtext_codec.codec import _stable_candidates, _step_distribution
+from subtext_codec.codec import MAX_PAYLOAD_BYTES, _stable_candidates, _step_distribution
 
 from conftest import make_fake_components
 
@@ -312,6 +312,19 @@ def test_top_k_too_small_is_rejected(fake_components):
     tokenizer, model = fake_components
     with pytest.raises(ValueError, match="top_k must be"):
         encode_data_to_text(b"x", make_config(top_k=1), model, tokenizer)
+
+
+def test_oversized_payload_is_rejected_at_encode(fake_components):
+    """A payload the decoder would call implausible must fail at encode time.
+
+    The guard fires before any generation, so this does not run the model on a
+    16MB payload; it just refuses to create a message that could not decode.
+    """
+    tokenizer, model = fake_components
+    with pytest.raises(ValueError, match="maximum is"):
+        encode_data_to_text(
+            b"\x00" * (MAX_PAYLOAD_BYTES + 1), make_config(), model, tokenizer
+        )
 
 
 def test_empty_prompt_is_rejected(fake_components):

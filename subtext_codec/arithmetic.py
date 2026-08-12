@@ -138,7 +138,17 @@ def quantize_frequencies(probs: torch.Tensor, total: int = FREQ_TOTAL) -> List[i
 
     Every step of this is deterministic -- float64 throughout, stable sorts --
     because encoder and decoder must derive byte-identical tables.
+
+    The alphabet cannot exceed ``total``: every frequency is forced to at least
+    1, so more than ``total`` symbols cannot sum to ``total``. Reject that
+    rather than spin forever trying to reclaim frequencies that are all already
+    at the floor.
     """
+    if len(probs) > total:
+        raise ValueError(
+            f"cannot build a frequency table for {len(probs)} symbols in "
+            f"{total} units; the alphabet is larger than FREQ_TOTAL. Lower top_k."
+        )
     p = probs.double()
     p = p / p.sum()
     raw = p * total

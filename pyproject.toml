@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "subtext-codec"
-version = "1.0.0"
-description = "Steganographic data encoding in LLM-generated text using logit rank steering."
+version = "1.0.1"
+description = "Steganographic data encoding in LLM-generated text via arithmetic coding against the model's own next-token distribution."
 readme = "README.md"
 authors = [{ name = "Shevis Johnson" , email = "hello@shev.is" }]
 requires-python = ">=3.10"

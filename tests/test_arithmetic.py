@@ -49,6 +49,17 @@ def test_frequencies_are_deterministic():
     assert quantize_frequencies(probs) == quantize_frequencies(probs.clone())
 
 
+def test_frequencies_reject_an_alphabet_larger_than_the_total():
+    """More symbols than FREQ_TOTAL cannot each hold a frequency of >= 1.
+
+    Regression guard: the reclaim branch used to spin forever here, because no
+    frequency could be pushed below the floor of 1 to recover the overflow.
+    """
+    probs = torch.ones(FREQ_TOTAL + 1, dtype=torch.float64)
+    with pytest.raises(ValueError, match="larger than FREQ_TOTAL"):
+        quantize_frequencies(probs)
+
+
 # --------------------------------------------------------------------------
 # bit packing
 # --------------------------------------------------------------------------
