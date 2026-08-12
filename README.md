@@ -47,6 +47,8 @@ So a candidate is only usable if appending it leaves the surrounding text re-tok
 - Tokenizer-stable candidate selection, verified before any message is returned
 - Self-inverse check at encode time -- the coder re-encodes as it goes and refuses to emit a message it cannot read back
 - Framed payload with a CRC32, so a wrong key, prompt or model is detected rather than yielding plausible wrong bytes
+- Optional zlib compression (`--compress`), which shortens the cover text and makes the payload bits more uniform
+- Multi-segment chunking (`--chunk-bytes`), so a payload can exceed the model's context window
 - Incremental KV-cached stepping, so cost is linear in message length rather than quadratic
 - Deterministic throughout; verified bit-identical on CPU and CUDA across fp32/bf16/fp16
 - Hugging Face Transformers backend -- works with most causal LMs
@@ -78,7 +80,7 @@ uv pip install -e .
 
 ## Usage
 
-The CLI exposes `encode` and `decode`. Shared flags:
+Run `subtext-codec --version` to print the installed version. The CLI otherwise exposes `encode` and `decode`. Shared flags:
 
 - `--key` -- path to the codec key file (required)
 - `--model-name-or-path` -- HuggingFace model id or local path; optional if stored in the key
@@ -105,11 +107,15 @@ Encode-only flags:
 
 - `--temperature` -- the capacity dial (default: 1.5). Higher packs more payload per token and shortens the cover text, at the cost of more erratic prose. See [Choosing a temperature](#choosing-a-temperature).
 - `--top-k` -- candidates considered per step (default: 64). This bounds the stability filter's work; it is not a capacity dial. Must be at least 2.
-- `--max-new-tokens` -- fail rather than generate more than this many tokens
+- `--compress` -- zlib-compress the payload before encoding. Shortens the cover text and makes the payload bits more uniform. Recorded in the key, so decoding reverses it automatically. See [Compression](#compression).
+- `--chunk-bytes N` -- split payloads larger than `N` bytes across several re-anchored segments, so a message can exceed the model's context window. See [Large payloads and chunking](#large-payloads-and-chunking).
+- `--max-new-tokens` -- fail rather than generate more than this many tokens per segment
 - `--no-store-model` -- keep the model id out of the key
 - `--verify` -- decode the result before writing it, confirming the round trip end to end
 
-The output text is just the generated story, with no metadata header. `key.json` records `temperature`, `top_k`, the prompt prefix, the device, the dtype and (unless `--no-store-model`) the model id.
+Unless `--quiet`, encoding prints a one-line summary to stderr -- payload size, cover tokens, segments, bits per token and mean surprisal -- so you can see the coder is running at the distribution's entropy.
+
+The output text is just the generated story, with no metadata header. `key.json` records `temperature`, `top_k`, the prompt prefix, the device, the dtype, (unless `--no-store-model`) the model id, and -- when compression is used -- a `compression` field and a `"version": "v2"` marker.
 
 If the path given to `--key` already exists, its values are reused as defaults and any CLI overrides are written back, so a second message needs only the key:
 
@@ -177,7 +183,48 @@ For reference, the rank-coding scheme this replaced in 1.0 managed 4.35 bits/tok
 
 **A bigger model does not buy more capacity.** A stronger model concentrates probability mass, which *lowers* entropy and therefore bits per token. It buys better prose at a given temperature, not shorter text. Keep payloads to a few hundred bytes, and pick a prompt whose natural continuation is long-form so the required length is not conspicuous.
 
-**Encrypt or compress first if it matters.** The indistinguishability argument assumes the payload bits look uniform. Feeding raw ASCII biases the emitted text.
+---
+
+## Compression
+
+`--compress` zlib-compresses the payload before encoding. It does two useful things:
+
+- **Shortens the cover text.** Fewer payload bytes means fewer tokens to carry them.
+- **Makes the bits more uniform**, which is exactly what the indistinguishability argument assumes. Raw ASCII is biased; compressed (or encrypted) data is not.
+
+```bash
+subtext-codec encode --key key.json --input-bytes secret.txt --output-text message.txt --compress
+```
+
+Compression is recorded in the key, so `decode` reverses it automatically -- you do not pass `--compress` when decoding. A compressed message uses the `v2` wire format (see [Compatibility](#compatibility)). The whole payload is framed with a length and CRC32 *before* compression, so a key that misdescribes compression is caught rather than returning the raw compressed bytes.
+
+Compression rarely helps on data that is already high-entropy (encrypted blobs, media). It helps most on text and structured data.
+
+## Large payloads and chunking
+
+A single message must fit the model's context window. `--chunk-bytes N` lifts that ceiling: payloads larger than `N` bytes are split into chunks, each encoded as its own segment generated fresh from the prompt, so the text reads as the prompt followed by a passage, then the prompt again, and so on.
+
+```bash
+subtext-codec encode --key key.json --input-bytes big.bin --output-text message.txt --chunk-bytes 256
+```
+
+The decoder needs nothing extra: it re-anchors on each occurrence of the prompt, decodes one chunk from each, and concatenates them. Each chunk carries its own index, the total count and a CRC32, so a dropped or reordered segment is detected, and text surrounding or between the segments is ignored just as it is for a single message. Chunking also uses the `v2` wire format.
+
+Pick `--chunk-bytes` comfortably below what one segment can hold at your temperature; if a chunk still overflows the context, encoding fails with a message telling you to lower it. Because each segment re-anchors the same prompt, a very long message repeats that prompt many times -- choose a prompt whose repetition is not itself conspicuous.
+
+## Encryption
+
+The codec is **not a cipher** -- the key is metadata, not a secret, and anyone with it and the model can read the message. For confidentiality, encrypt the payload yourself before encoding. Encryption also gives you the uniform bits the indistinguishability argument wants, so you do not additionally need `--compress` (encrypted data will not compress anyway).
+
+```bash
+# encrypt, then hide; the codec never sees the plaintext
+age -r age1... secret.txt | subtext-codec encode --key key.json --input-bytes - --output-text message.txt
+
+# recover, then decrypt
+subtext-codec decode --key key.json --input-text message.txt --output-bytes - | age -d -i key.txt > secret.txt
+```
+
+Any tool works -- `age`, `gpg`, `openssl enc`. Keeping encryption out of the codec is deliberate: this is a research prototype, and rolling in a cipher would imply a security property it does not provide.
 
 ---
 
@@ -215,9 +262,14 @@ Those parametrize over every device and dtype present, so on a GPU box they addi
 
 ## Compatibility
 
-1.0 reads and writes one wire format, `v1`, and nothing else. Every pre-1.0 format is gone along with the code that decoded them: they used rank coding, which corrupted roughly a third of its own messages and never produced model-distributed output.
+There are two wire formats:
 
-Pre-1.0 also numbered a format `v1`, but that one carried `base`/`top_p` and no `temperature`, so the collision is detectable -- such a key fails with an explanation rather than a generic error. To read a message encoded before 1.0, install `subtext-codec~=0.2.0`; to keep it, re-encode the payload with this version.
+- **`v1`** -- a single segment framing `length || crc32 || data`, exactly as 1.0 wrote it. A plain message (no compression, no chunking) is still written as `v1`, so it stays byte-for-byte readable by 1.0.
+- **`v2`** -- added in 1.1 for compression and chunking. The key records `"version": "v2"`, and the payload is framed once with a length and CRC over the original data, then optionally compressed, then split into chunk-framed segments. A 1.0 reader rejects a `v2` key outright rather than mis-reading it, which is why the new features carry a new version.
+
+1.1 reads both. It writes `v2` only when you ask for compression or chunking; everything else stays `v1`.
+
+Every pre-1.0 format is gone along with the code that decoded them: they used rank coding, which corrupted roughly a third of its own messages and never produced model-distributed output. Pre-1.0 also numbered a format `v1`, but that one carried `base`/`top_p` and no `temperature`, so the collision is detectable -- such a key fails with an explanation rather than a generic error. To read a message encoded before 1.0, install `subtext-codec~=0.2.0`; to keep it, re-encode the payload with this version.
 
 ---
 
@@ -225,8 +277,8 @@ Pre-1.0 also numbered a format `v1`, but that one carried `base`/`top_p` and no 
 
 * **Brittle to edits**: changing a single token of the output breaks decoding. This is an encoding scheme, not an error-correcting one.
 * **Model-dependent**: requires the exact same weights, tokenizer *and* dtype. Decoding a bf16 encode in fp32 will not work.
-* **Not confidential on its own**: the key is metadata, not a cipher. Encrypt the payload before encoding it -- both for secrecy and because the indistinguishability argument assumes uniform payload bits.
-* **Context length**: large payloads may exceed the model's context window; there is no chunking.
+* **Not confidential on its own**: the key is metadata, not a cipher. [Encrypt the payload](#encryption) before encoding it -- both for secrecy and because the indistinguishability argument assumes uniform payload bits.
+* **Context length**: a single segment must fit the model's context window. `--chunk-bytes` splits larger payloads across segments, at the cost of repeating the prompt once per segment.
 * **Capacity**: the distribution's entropy, typically 1-5 bits per token depending on temperature. Expect a few hundred tokens per hundred bytes.
 * **Length is the remaining tell**: the per-token statistics are right, but a 900-token hotel review is still an odd thing to find. Pick a prompt whose natural continuation is long-form.
 * **"Indistinguishable" is relative to the temperature you chose**: output at `temperature=1.5` is exactly temperature-1.5 sampling, which is only unremarkable to someone who has no expectation about the setting. An adversary who knows you would have sampled at 1.0 can distinguish it in aggregate. Lower temperature closes that gap and lengthens the text.

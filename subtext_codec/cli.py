@@ -3,11 +3,13 @@ import os
 import sys
 from typing import List, Optional
 
+from . import __version__
 from .codec import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     CodecConfig,
     CodecKey,
+    EncodeStats,
     decode_text_to_data,
     encode_data_to_text,
     load_codec_key,
@@ -73,6 +75,31 @@ class _Progress:
             sys.stderr.flush()
 
 
+def _stats_reporter(enabled: bool):
+    """Return a report_stats callback that prints one summary line to stderr.
+
+    Uses stderr so it never contaminates piped output, and returns None when
+    disabled so the encoder does no accounting work it will not use.
+    """
+    if not (enabled and sys.stderr.isatty()):
+        return None
+
+    def report(stats: EncodeStats) -> None:
+        seg = "segment" if stats.segments == 1 else "segments"
+        line = (
+            f"encoded {stats.payload_bytes} B into {stats.tokens} tokens across "
+            f"{stats.segments} {seg} "
+            f"({stats.bits_per_token:.2f} bits/token, "
+            f"surprisal {stats.mean_surprisal_bits:.2f})"
+        )
+        if stats.compressed:
+            line += f"; compressed {stats.payload_bytes} -> {stats.stored_bytes} B"
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+    return report
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subtext-codec",
@@ -80,6 +107,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Hide bytes inside LLM-generated text by arithmetic coding against "
             "the model's own next-token distribution."
         ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="print the installed subtext-codec version and exit",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -138,7 +171,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-new-tokens",
         type=int,
         default=None,
-        help="fail rather than generate more than this many tokens",
+        help="fail rather than generate more than this many tokens per segment",
+    )
+    enc.add_argument(
+        "--compress",
+        action="store_true",
+        help=(
+            "zlib-compress the payload before encoding (recorded in the key). "
+            "Shortens the cover text and makes the payload bits more uniform. "
+            "Uses the v2 wire format."
+        ),
+    )
+    enc.add_argument(
+        "--chunk-bytes",
+        type=int,
+        default=None,
+        help=(
+            "split payloads larger than this many bytes across re-anchored "
+            "segments, so a message can exceed the model's context window. "
+            "Uses the v2 wire format."
+        ),
     )
     enc.add_argument("--input-bytes", required=True, help="payload file, or - for stdin")
     enc.add_argument(
@@ -203,6 +255,9 @@ def run_encode(args) -> None:
     )
     torch_dtype = _first(args.torch_dtype, existing.torch_dtype if existing else None)
     device = _first(args.device, existing.device if existing else None, "cpu")
+    # A key that already records compression keeps compressing on re-encode, so a
+    # second message written against it matches the first without restating it.
+    compress = args.compress or bool(existing and existing.compression == "zlib")
 
     set_deterministic(args.seed)
     tokenizer, model = load_model_and_tokenizer(
@@ -219,12 +274,17 @@ def run_encode(args) -> None:
         torch_dtype=torch_dtype,
         store_model_in_key=not args.no_store_model,
         max_new_tokens=args.max_new_tokens,
+        compress=compress,
+        chunk_bytes=args.chunk_bytes,
     )
 
     payload = _read_bytes(args.input_bytes)
     progress = _Progress("encoding", not args.quiet)
+    reporter = _stats_reporter(not args.quiet)
     try:
-        text, key = encode_data_to_text(payload, cfg, model, tokenizer, progress=progress)
+        text, key = encode_data_to_text(
+            payload, cfg, model, tokenizer, progress=progress, report_stats=reporter
+        )
     finally:
         progress.done()
 

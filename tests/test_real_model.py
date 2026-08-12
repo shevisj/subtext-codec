@@ -61,6 +61,76 @@ def test_real_model_round_trip(payload, real_components):
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize(
+    "payload",
+    [b"", b"\x00\x00secret", b"attack at dawn", bytes(range(48))],
+    ids=["empty", "leading-zeros", "text", "binary"],
+)
+def test_real_model_compressed_round_trip(payload, real_components):
+    tokenizer, model = real_components
+    cfg = make_config(compress=True)
+
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.compression == "zlib"
+
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=PROMPT, model=model,
+        tokenizer=tokenizer, device="cpu",
+    )
+    assert decoded == payload
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("chunk_bytes", [4, 8, 16])
+def test_real_model_chunked_round_trip(chunk_bytes, real_components):
+    """Multi-segment on a real byte-level BPE vocabulary, where boundary merges
+    between a segment and the next re-anchored prompt are a genuine hazard."""
+    tokenizer, model = real_components
+    payload = bytes(range(40))
+    cfg = make_config(chunk_bytes=chunk_bytes)
+
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert text.count(PROMPT) >= 2  # actually chunked
+
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=PROMPT, model=model,
+        tokenizer=tokenizer, device="cpu",
+    )
+    assert decoded == payload
+
+
+@pytest.mark.slow
+def test_real_model_compressed_and_chunked_round_trip(real_components):
+    tokenizer, model = real_components
+    payload = b"the quick brown fox jumps over the lazy dog. " * 4
+    cfg = make_config(compress=True, chunk_bytes=24)
+
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=PROMPT, model=model,
+        tokenizer=tokenizer, device="cpu",
+    )
+    assert decoded == payload
+
+
+@pytest.mark.slow
+def test_real_model_chunked_survives_surrounding_noise(real_components):
+    tokenizer, model = real_components
+    payload = bytes(range(36))
+    text, key = encode_data_to_text(
+        payload, make_config(chunk_bytes=8), model, tokenizer
+    )
+    noisy = "Fwd:\n\n" + text + "\n\n-- sent from my phone"
+    decoded = decode_text_to_data(
+        noisy, key=key, prompt_prefix=PROMPT, model=model,
+        tokenizer=tokenizer, device="cpu",
+    )
+    assert decoded == payload
+
+
+@pytest.mark.slow
 def test_real_model_text_is_tokenizer_stable(real_components):
     """The property that made the pre-v3 codec corrupt messages at random.
 

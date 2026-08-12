@@ -9,10 +9,12 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 from .codec import (  # noqa: E402  (must follow the environment default above)
     CODEC_VERSION,
+    CODEC_VERSION_V2,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     CodecConfig,
     CodecKey,
+    EncodeStats,
     decode_text_to_data,
     encode_data_to_text,
     load_codec_key,
@@ -30,10 +32,12 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 
 __all__ = [
     "CODEC_VERSION",
+    "CODEC_VERSION_V2",
     "DEFAULT_TEMPERATURE",
     "DEFAULT_TOP_K",
     "CodecConfig",
     "CodecKey",
+    "EncodeStats",
     "__version__",
     "decode_text_to_data",
     "encode_data_to_text",

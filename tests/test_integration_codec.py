@@ -7,7 +7,12 @@ import torch
 
 import subtext_codec
 from subtext_codec import CodecConfig, cli, decode_text_to_data, encode_data_to_text
-from subtext_codec.codec import MAX_PAYLOAD_BYTES, _stable_candidates, _step_distribution
+from subtext_codec.codec import (
+    MAX_PAYLOAD_BYTES,
+    _HEADER,
+    _stable_candidates,
+    _step_distribution,
+)
 
 from conftest import make_fake_components
 
@@ -154,6 +159,166 @@ def test_model_name_withheld_when_not_stored(fake_components):
 
 
 # --------------------------------------------------------------------------
+# compression (v2)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"", b"a", b"hello world", b"\x00\x00\x00zeros", b"repeat " * 20],
+    ids=["empty", "single", "text", "leading-zeros", "compressible"],
+)
+def test_round_trip_compressed(payload, fake_components):
+    assert round_trip(payload, fake_components, compress=True) == payload
+
+
+def test_compression_records_v2_and_the_codec(fake_components):
+    tokenizer, model = fake_components
+    _, key = encode_data_to_text(
+        b"compress me", make_config(compress=True), model, tokenizer
+    )
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.compression == "zlib"
+
+
+def test_plain_message_stays_v1(fake_components):
+    tokenizer, model = fake_components
+    _, key = encode_data_to_text(b"plain", make_config(), model, tokenizer)
+    assert key.version == subtext_codec.CODEC_VERSION
+    assert key.compression is None
+
+
+def test_wrong_compression_flag_fails_to_decode(fake_components):
+    """A key that misdescribes compression must not return plausible garbage."""
+    tokenizer, model = fake_components
+    text, key = encode_data_to_text(
+        b"a real payload here", make_config(compress=True), model, tokenizer
+    )
+    key.compression = None  # claim it was never compressed
+    with pytest.raises(ValueError):
+        decode_text_to_data(
+            text, key=key, prompt_prefix=PROMPT, model=model,
+            tokenizer=tokenizer, device="cpu",
+        )
+
+
+# --------------------------------------------------------------------------
+# multi-segment chunking (v2)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chunk_bytes", [1, 4, 8, 16])
+@pytest.mark.parametrize(
+    "payload",
+    [b"", b"tiny", b"\x00\x00\x00leading zeros here", bytes(range(48))],
+    ids=["empty", "tiny", "leading-zeros", "binary"],
+)
+def test_round_trip_chunked(chunk_bytes, payload, fake_components):
+    assert round_trip(payload, fake_components, chunk_bytes=chunk_bytes) == payload
+
+
+def test_chunking_splits_into_the_expected_segments(fake_components):
+    tokenizer, model = fake_components
+    payload = bytes(range(40))
+    stats = {}
+    text, key = encode_data_to_text(
+        payload,
+        make_config(chunk_bytes=8),
+        model,
+        tokenizer,
+        report_stats=lambda s: stats.update(vars(s)),
+    )
+    # The whole payload is framed with an 8-byte manifest header before chunking.
+    expected = -(-(len(payload) + _HEADER.size) // 8)  # ceil((40 + 8) / 8) == 6
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert stats["segments"] == expected
+    assert text.count(PROMPT) >= expected  # the prompt re-anchors each segment
+
+
+def test_small_payload_with_chunk_bytes_stays_single_segment(fake_components):
+    """chunk_bytes only splits when the payload actually exceeds it."""
+    tokenizer, model = fake_components
+    _, key = encode_data_to_text(
+        b"short", make_config(chunk_bytes=1024), model, tokenizer
+    )
+    assert key.version == subtext_codec.CODEC_VERSION  # one chunk, uncompressed
+
+
+def test_round_trip_compressed_and_chunked(fake_components):
+    payload = b"the quick brown fox jumps over the lazy dog " * 8
+    decoded = round_trip(payload, fake_components, compress=True, chunk_bytes=16)
+    assert decoded == payload
+
+
+def test_chunked_decoder_ignores_surrounding_noise(fake_components):
+    tokenizer, model = fake_components
+    payload = bytes(range(30))
+    cfg = make_config(chunk_bytes=8)
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+
+    decoded = decode_text_to_data(
+        "noise. " + text + " trailing!",
+        key=key, prompt_prefix=PROMPT, model=model, tokenizer=tokenizer, device="cpu",
+    )
+    assert decoded == payload
+
+
+def test_tampering_one_chunk_is_caught(fake_components):
+    tokenizer, model = fake_components
+    payload = bytes(range(40))
+    cfg = make_config(chunk_bytes=8)
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+
+    # Insert text into the first segment's body, shifting its tokens.
+    idx = text.find(PROMPT) + len(PROMPT)
+    tampered = text[:idx] + "zzz " + text[idx:]
+    with pytest.raises(ValueError):
+        decode_text_to_data(
+            tampered, key=key, prompt_prefix=PROMPT, model=model,
+            tokenizer=tokenizer, device="cpu",
+        )
+
+
+# --------------------------------------------------------------------------
+# encode statistics
+# --------------------------------------------------------------------------
+
+
+def test_encode_stats_are_reported(fake_components):
+    tokenizer, model = fake_components
+    seen = []
+    encode_data_to_text(
+        b"measure me please",
+        make_config(),
+        model,
+        tokenizer,
+        report_stats=seen.append,
+    )
+    assert len(seen) == 1
+    stats = seen[0]
+    assert isinstance(stats, subtext_codec.EncodeStats)
+    assert stats.payload_bytes == len(b"measure me please")
+    assert stats.stored_bytes == stats.payload_bytes  # not compressed
+    assert stats.segments == 1
+    assert not stats.compressed
+    assert stats.tokens > 0
+    assert stats.bits_per_token > 0
+    assert stats.mean_surprisal_bits > 0
+
+
+def test_compression_stats_show_the_stored_size(fake_components):
+    tokenizer, model = fake_components
+    seen = []
+    encode_data_to_text(
+        b"repeat " * 40, make_config(compress=True), model, tokenizer,
+        report_stats=seen.append,
+    )
+    stats = seen[0]
+    assert stats.compressed
+    assert stats.stored_bytes < stats.payload_bytes  # repetitive data compresses
+
+
+# --------------------------------------------------------------------------
 # the tokenizer-stability filter
 # --------------------------------------------------------------------------
 
@@ -230,7 +395,7 @@ def test_missing_prompt_in_text_is_rejected(fake_components):
         )
 
 
-@pytest.mark.parametrize("version", ["v2", "v3", "v99"])
+@pytest.mark.parametrize("version", ["v3", "v99", "v100"])
 def test_foreign_key_versions_are_refused(version, fake_components):
     tokenizer, model = fake_components
     text, key = encode_data_to_text(b"versioned", make_config(), model, tokenizer)
@@ -471,6 +636,60 @@ def test_cli_reuses_stored_key_parameters(tmp_path, cli_with_fake_model):
         ]
     )
     assert second_out.read_bytes() == b"second payload"
+
+
+def test_cli_compress_round_trip(tmp_path, cli_with_fake_model):
+    payload = b"compress this over the cli " * 6
+    paths = run_cli_round_trip(tmp_path, payload, extra_encode=("--compress",))
+    assert paths["output"].read_bytes() == payload
+
+    key = subtext_codec.load_codec_key(paths["key"])
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.compression == "zlib"
+
+
+def test_cli_chunk_bytes_round_trip(tmp_path, cli_with_fake_model):
+    payload = bytes(range(50))
+    paths = run_cli_round_trip(tmp_path, payload, extra_encode=("--chunk-bytes", "8"))
+    assert paths["output"].read_bytes() == payload
+
+    key = subtext_codec.load_codec_key(paths["key"])
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+
+
+def test_cli_reused_key_keeps_compressing(tmp_path, cli_with_fake_model):
+    """A key that recorded compression compresses the next message too."""
+    paths = run_cli_round_trip(tmp_path, b"first message here", extra_encode=("--compress",))
+
+    second_in = tmp_path / "second_in.bin"
+    second_in.write_bytes(b"second message body")
+    second_text = tmp_path / "second.txt"
+    second_out = tmp_path / "second.bin"
+
+    cli.main([
+        "encode",
+        "--input-bytes", str(second_in),
+        "--output-text", str(second_text),
+        "--key", str(paths["key"]),
+    ])
+    assert subtext_codec.load_codec_key(paths["key"]).compression == "zlib"
+
+    cli.main([
+        "decode",
+        "--input-text", str(second_text),
+        "--output-bytes", str(second_out),
+        "--key", str(paths["key"]),
+    ])
+    assert second_out.read_bytes() == b"second message body"
+
+
+def test_cli_version_flag_prints_and_exits(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--version"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "subtext-codec" in out
+    assert subtext_codec.__version__ in out
 
 
 def test_cli_no_store_model(tmp_path, cli_with_fake_model):
