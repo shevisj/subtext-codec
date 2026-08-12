@@ -48,7 +48,7 @@ So a candidate is only usable if appending it leaves the surrounding text re-tok
 - Self-inverse check at encode time -- the coder re-encodes as it goes and refuses to emit a message it cannot read back
 - Framed payload with a CRC32, so a wrong key, prompt or model is detected rather than yielding plausible wrong bytes
 - Optional zlib compression (`--compress`), which shortens the cover text and makes the payload bits more uniform
-- Multi-segment chunking (`--chunk-bytes`), so a payload can exceed the model's context window
+- Automatic rolling context window, so a payload can exceed the model's context window with no repeated prompt and no tuning
 - Incremental KV-cached stepping, so cost is linear in message length rather than quadratic
 - Deterministic throughout; verified bit-identical on CPU and CUDA across fp32/bf16/fp16
 - Hugging Face Transformers backend -- works with most causal LMs
@@ -108,14 +108,15 @@ Encode-only flags:
 - `--temperature` -- the capacity dial (default: 1.5). Higher packs more payload per token and shortens the cover text, at the cost of more erratic prose. See [Choosing a temperature](#choosing-a-temperature).
 - `--top-k` -- candidates considered per step (default: 64). This bounds the stability filter's work; it is not a capacity dial. Must be at least 2.
 - `--compress` -- zlib-compress the payload before encoding. Shortens the cover text and makes the payload bits more uniform. Recorded in the key, so decoding reverses it automatically. See [Compression](#compression).
-- `--chunk-bytes N` -- split payloads larger than `N` bytes across several re-anchored segments, so a message can exceed the model's context window. See [Large payloads and chunking](#large-payloads-and-chunking).
-- `--max-new-tokens` -- fail rather than generate more than this many tokens per segment
+- `--max-new-tokens` -- fail rather than generate more than this many tokens
 - `--no-store-model` -- keep the model id out of the key
 - `--verify` -- decode the result before writing it, confirming the round trip end to end
 
-Unless `--quiet`, encoding prints a one-line summary to stderr -- payload size, cover tokens, segments, bits per token and mean surprisal -- so you can see the coder is running at the distribution's entropy.
+Payloads too long for one context window are handled automatically; see [Large payloads](#large-payloads).
 
-The output text is just the generated story, with no metadata header. `key.json` records `temperature`, `top_k`, the prompt prefix, the device, the dtype, (unless `--no-store-model`) the model id, and -- when compression is used -- a `compression` field and a `"version": "v2"` marker.
+Unless `--quiet`, encoding prints a one-line summary to stderr -- payload size, cover tokens, bits per token and mean surprisal (and how many times the context rolled) -- so you can see the coder is running at the distribution's entropy.
+
+The output text is just the generated story, with no metadata header. `key.json` records `temperature`, `top_k`, the prompt prefix, the device, the dtype, (unless `--no-store-model`) the model id, and -- when compression or the rolling window is used -- a `compression` or `window` field and a `"version": "v2"` marker.
 
 If the path given to `--key` already exists, its values are reused as defaults and any CLI overrides are written back, so a second message needs only the key:
 
@@ -200,17 +201,21 @@ Compression is recorded in the key, so `decode` reverses it automatically -- you
 
 Compression rarely helps on data that is already high-entropy (encrypted blobs, media). It helps most on text and structured data.
 
-## Large payloads and chunking
+## Large payloads
 
-A single message must fit the model's context window. `--chunk-bytes N` lifts that ceiling: payloads larger than `N` bytes are split into chunks, each encoded as its own segment generated fresh from the prompt, so the text reads as the prompt followed by a passage, then the prompt again, and so on.
+A payload can outgrow the model's context window, and that is handled automatically -- there is nothing to configure. When the context fills, the codec re-prefixes the most recent half of the tokens and keeps generating, a **rolling window** that slides forward as the message grows. The text stays one continuous passage: the prompt appears once, at the start, and never repeats.
 
 ```bash
-subtext-codec encode --key key.json --input-bytes big.bin --output-text message.txt --chunk-bytes 256
+# no special flags: a long payload just works
+subtext-codec encode --key key.json --input-bytes big.bin --output-text message.txt
 ```
 
-The decoder needs nothing extra: it re-anchors on each occurrence of the prompt, decodes one chunk from each, and concatenates them. Each chunk carries its own index, the total count and a CRC32, so a dropped or reordered segment is detected, and text surrounding or between the segments is ignored just as it is for a single message. Chunking also uses the `v2` wire format.
+The decoder resets at the same points, so it recovers the message exactly. The window size it used rides in the key (a `window` field), so decoding needs nothing extra. A message that rolls uses the `v2` wire format; one that fits a single window stays `v1`.
 
-Pick `--chunk-bytes` comfortably below what one segment can hold at your temperature; if a chunk still overflows the context, encoding fails with a message telling you to lower it. Because each segment re-anchors the same prompt, a very long message repeats that prompt many times -- choose a prompt whose repetition is not itself conspicuous.
+Two things worth knowing:
+
+- **The window follows the model's context limit** (or `--max-context-length`, if you set a smaller one). Because the size is recorded in the key, encode and decode agree automatically -- but if you decode with a *different* explicit `--max-context-length`, the key's value still wins.
+- **Coherence is over the window, not the whole text.** Past the first reset the model conditions on a sliding window of recent tokens rather than the entire history, so very long messages read like natural long-form drift rather than a single tightly-planned document. See the caveat in [Limitations](#limitations).
 
 ## Encryption
 
@@ -264,10 +269,10 @@ Those parametrize over every device and dtype present, so on a GPU box they addi
 
 There are two wire formats:
 
-- **`v1`** -- a single segment framing `length || crc32 || data`, exactly as 1.0 wrote it. A plain message (no compression, no chunking) is still written as `v1`, so it stays byte-for-byte readable by 1.0.
-- **`v2`** -- added in 1.1 for compression and chunking. The key records `"version": "v2"`, and the payload is framed once with a length and CRC over the original data, then optionally compressed, then split into chunk-framed segments. A 1.0 reader rejects a `v2` key outright rather than mis-reading it, which is why the new features carry a new version.
+- **`v1`** -- a single segment framing `length || crc32 || data`, exactly as 1.0 wrote it. A plain message that fits one context window (no compression, no rolling) is still written as `v1`, so it stays byte-for-byte readable by 1.0.
+- **`v2`** -- added in 1.1 for compression and the rolling window. The key records `"version": "v2"` and, as needed, a `compression` field and a `window` field. Compressed payloads frame a length and CRC over the *original* data so a wrong compression flag is caught; rolled payloads carry the window so the decoder resets at the same points. A 1.0 reader rejects a `v2` key outright rather than mis-reading it, which is why the new features carry a new version.
 
-1.1 reads both. It writes `v2` only when you ask for compression or chunking; everything else stays `v1`.
+1.1 reads both. It writes `v2` only when you compress or when the payload is long enough to roll the context; everything else stays `v1`.
 
 Every pre-1.0 format is gone along with the code that decoded them: they used rank coding, which corrupted roughly a third of its own messages and never produced model-distributed output. Pre-1.0 also numbered a format `v1`, but that one carried `base`/`top_p` and no `temperature`, so the collision is detectable -- such a key fails with an explanation rather than a generic error. To read a message encoded before 1.0, install `subtext-codec~=0.2.0`; to keep it, re-encode the payload with this version.
 
@@ -278,7 +283,7 @@ Every pre-1.0 format is gone along with the code that decoded them: they used ra
 * **Brittle to edits**: changing a single token of the output breaks decoding. This is an encoding scheme, not an error-correcting one.
 * **Model-dependent**: requires the exact same weights, tokenizer *and* dtype. Decoding a bf16 encode in fp32 will not work.
 * **Not confidential on its own**: the key is metadata, not a cipher. [Encrypt the payload](#encryption) before encoding it -- both for secrecy and because the indistinguishability argument assumes uniform payload bits.
-* **Context length**: a single segment must fit the model's context window. `--chunk-bytes` splits larger payloads across segments, at the cost of repeating the prompt once per segment.
+* **Context length**: handled automatically by the rolling window, but past the first reset the model conditions on recent tokens rather than the whole history. Coherence is local to the window, and a discriminator with the full text could in principle notice the long-range structure "resetting" -- subtle for a reasonable window, but a real difference from full-context sampling, on top of the temperature caveat below.
 * **Capacity**: the distribution's entropy, typically 1-5 bits per token depending on temperature. Expect a few hundred tokens per hundred bytes.
 * **Length is the remaining tell**: the per-token statistics are right, but a 900-token hotel review is still an odd thing to find. Pick a prompt whose natural continuation is long-form.
 * **"Indistinguishable" is relative to the temperature you chose**: output at `temperature=1.5` is exactly temperature-1.5 sampling, which is only unremarkable to someone who has no expectation about the setting. An adversary who knows you would have sampled at 1.0 can distinguish it in aggregate. Lower temperature closes that gap and lengthens the text.

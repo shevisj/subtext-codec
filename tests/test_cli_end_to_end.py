@@ -69,8 +69,11 @@ def test_cli_round_trip_across_processes(payload, tmp_path):
 
 
 @pytest.mark.slow
-def test_cli_compressed_and_chunked_round_trip_across_processes(tmp_path):
-    """The v2 features driven the way the tool is really used: two processes."""
+def test_cli_compressed_and_rolling_round_trip_across_processes(tmp_path):
+    """The v2 features driven the way the tool is really used: two processes.
+
+    A small context window forces the roll; the window rides in the key, so the
+    second process needs nothing but the key to decode."""
     payload = b"the quick brown fox jumps over the lazy dog. " * 3
     payload_file = tmp_path / "in.bin"
     payload_file.write_bytes(payload)
@@ -89,13 +92,14 @@ def test_cli_compressed_and_chunked_round_trip_across_processes(tmp_path):
         "--top-k", "32",
         "--temperature", "1.5",
         "--compress",
-        "--chunk-bytes", "24",
+        "--max-context-length", "48",
         "--quiet",
     )
 
     stored = json.loads(key.read_text())
     assert stored["version"] == "v2"
     assert stored["compression"] == "zlib"
+    assert stored["window"] == 48
 
     run_cli(
         "decode",

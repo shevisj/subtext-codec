@@ -9,12 +9,8 @@ import subtext_codec
 from subtext_codec.arithmetic import to_bits
 from subtext_codec.codec import (
     MAX_PAYLOAD_BYTES,
-    _CHUNK_HEADER_BITS,
-    _declared_chunk_length,
     _declared_length,
-    _frame_chunk,
     _frame_payload,
-    _unframe_chunk,
     _unframe_payload,
 )
 
@@ -77,64 +73,6 @@ def test_checksum_is_over_the_payload():
 
 
 # --------------------------------------------------------------------------
-# v2 chunk framing
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "index,count,data",
-    [
-        (0, 1, b""),
-        (0, 1, b"only"),
-        (0, 3, b"\x00\x00\x00leading"),
-        (2, 3, bytes(range(64))),
-        (65534, 65535, b"\xff" * 40),
-    ],
-)
-def test_chunk_framing_round_trip(index, count, data):
-    assert _unframe_chunk(_frame_chunk(index, count, data)) == (index, count, data)
-
-
-def test_chunk_framing_carries_index_and_count():
-    idx, cnt, data = _unframe_chunk(_frame_chunk(2, 5, b"middle"))
-    assert (idx, cnt, data) == (2, 5, b"middle")
-
-
-def test_chunk_framing_tolerates_trailing_bits():
-    framed = _frame_chunk(1, 2, b"exact") + [1, 0, 1, 1] * 6
-    assert _unframe_chunk(framed) == (1, 2, b"exact")
-
-
-def test_chunk_framing_rejects_a_corrupted_chunk():
-    framed = _frame_chunk(0, 2, b"tamper here")
-    framed[-1] ^= 1
-    with pytest.raises(ValueError, match="checksum"):
-        _unframe_chunk(framed)
-
-
-def test_chunk_framing_rejects_a_missing_header():
-    with pytest.raises(ValueError, match="chunk header"):
-        _unframe_chunk([1, 0, 1])
-
-
-def test_chunk_framing_rejects_an_implausible_length():
-    bogus = to_bits(
-        (0).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (MAX_PAYLOAD_BYTES + 1).to_bytes(4, "big")
-        + b"\x00" * 4
-    )
-    with pytest.raises(ValueError, match="implausible"):
-        _unframe_chunk(bogus)
-
-
-def test_declared_chunk_length_needs_a_full_header():
-    assert _declared_chunk_length([1] * (_CHUNK_HEADER_BITS - 1)) is None
-    framed = _frame_chunk(0, 1, b"1234")
-    assert _declared_chunk_length(framed) == len(framed)
-
-
-# --------------------------------------------------------------------------
 # codec keys
 # --------------------------------------------------------------------------
 
@@ -181,11 +119,30 @@ def test_codec_version_v2_is_exposed():
     assert subtext_codec.CODEC_VERSION_V2 == "v2"
 
 
-def test_v1_key_json_omits_compression_for_backward_compatibility():
+def test_v1_key_json_omits_v2_fields_for_backward_compatibility():
     """A plain key must stay byte-identical to what 1.0 wrote."""
     key = make_key()
     assert key.version == "v1"
-    assert "compression" not in key.to_dict()
+    on_disk = key.to_dict()
+    assert "compression" not in on_disk
+    assert "window" not in on_disk
+
+
+def test_v2_key_round_trips_with_window(tmp_path):
+    key = make_key(version="v2", window=1024)
+    path = tmp_path / "key.json"
+    subtext_codec.save_codec_key(key, path)
+    loaded = subtext_codec.load_codec_key(path)
+    assert loaded == key
+    assert loaded.window == 1024
+    assert json.loads(path.read_text())["window"] == 1024
+
+
+def test_window_must_be_at_least_two():
+    with pytest.raises(ValueError, match="window must be at least"):
+        subtext_codec.CodecKey.from_dict(
+            {"version": "v2", "top_k": 32, "temperature": 1.5, "window": 1}
+        )
 
 
 def test_v2_key_round_trips_with_compression(tmp_path):
@@ -303,4 +260,5 @@ def test_codec_key_has_no_rank_coding_fields():
         "torch_dtype",
         "version",
         "compression",
+        "window",
     }

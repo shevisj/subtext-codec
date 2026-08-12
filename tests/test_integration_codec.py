@@ -7,12 +7,7 @@ import torch
 
 import subtext_codec
 from subtext_codec import CodecConfig, cli, decode_text_to_data, encode_data_to_text
-from subtext_codec.codec import (
-    MAX_PAYLOAD_BYTES,
-    _HEADER,
-    _stable_candidates,
-    _step_distribution,
-)
+from subtext_codec.codec import MAX_PAYLOAD_BYTES, _stable_candidates, _step_distribution
 
 from conftest import make_fake_components
 
@@ -203,80 +198,103 @@ def test_wrong_compression_flag_fails_to_decode(fake_components):
 
 
 # --------------------------------------------------------------------------
-# multi-segment chunking (v2)
+# rolling context window (v2) -- automatic long-payload support
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("chunk_bytes", [1, 4, 8, 16])
+def rolling_round_trip(payload, components, window, **overrides):
+    """Encode with a small context window (forcing resets) and decode back."""
+    tokenizer, model = components
+    cfg = make_config(max_context_length=window, **overrides)
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=cfg.prompt_prefix, model=model,
+        tokenizer=tokenizer, device="cpu", max_context_length=window,
+    )
+    return text, key, decoded
+
+
+@pytest.mark.parametrize("window", [24, 32, 48])
 @pytest.mark.parametrize(
     "payload",
-    [b"", b"tiny", b"\x00\x00\x00leading zeros here", bytes(range(48))],
-    ids=["empty", "tiny", "leading-zeros", "binary"],
+    [b"\x00\x00\x00leading zeros here", bytes(range(48)), b"words " * 16],
+    ids=["leading-zeros", "binary", "text"],
 )
-def test_round_trip_chunked(chunk_bytes, payload, fake_components):
-    assert round_trip(payload, fake_components, chunk_bytes=chunk_bytes) == payload
+def test_round_trip_rolls_over_a_small_window(window, payload, fake_components):
+    _, key, decoded = rolling_round_trip(payload, fake_components, window)
+    assert decoded == payload
+    assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.window == window
 
 
-def test_chunking_splits_into_the_expected_segments(fake_components):
+def test_rolling_produces_one_continuous_passage(fake_components):
+    """The whole point: no repeated prompt, one flowing text."""
+    payload = bytes(range(40))
+    text, key, decoded = rolling_round_trip(payload, fake_components, window=32)
+    assert decoded == payload
+    assert text.count(PROMPT) == 1  # the prompt appears once, not per segment
+    assert key.window == 32
+
+
+def test_reset_count_is_reported(fake_components):
+    tokenizer, model = fake_components
+    seen = []
+    encode_data_to_text(
+        bytes(range(60)), make_config(max_context_length=32), model, tokenizer,
+        report_stats=seen.append,
+    )
+    assert seen[0].resets >= 1
+
+
+def test_short_payload_never_rolls(fake_components):
+    """A message that fits one window stays v1, with no window recorded."""
+    tokenizer, model = fake_components
+    _, key = encode_data_to_text(b"short", make_config(), model, tokenizer)
+    assert key.version == subtext_codec.CODEC_VERSION
+    assert key.window is None
+
+
+def test_rolling_with_compression(fake_components):
+    payload = b"the quick brown fox jumps over the lazy dog. " * 6
+    _, key, decoded = rolling_round_trip(payload, fake_components, window=48, compress=True)
+    assert decoded == payload
+    assert key.compression == "zlib"
+    assert key.window == 48
+
+
+def test_rolling_decoder_ignores_surrounding_noise(fake_components):
     tokenizer, model = fake_components
     payload = bytes(range(40))
-    stats = {}
-    text, key = encode_data_to_text(
-        payload,
-        make_config(chunk_bytes=8),
-        model,
-        tokenizer,
-        report_stats=lambda s: stats.update(vars(s)),
-    )
-    # The whole payload is framed with an 8-byte manifest header before chunking.
-    expected = -(-(len(payload) + _HEADER.size) // 8)  # ceil((40 + 8) / 8) == 6
-    assert key.version == subtext_codec.CODEC_VERSION_V2
-    assert stats["segments"] == expected
-    assert text.count(PROMPT) >= expected  # the prompt re-anchors each segment
-
-
-def test_small_payload_with_chunk_bytes_stays_single_segment(fake_components):
-    """chunk_bytes only splits when the payload actually exceeds it."""
-    tokenizer, model = fake_components
-    _, key = encode_data_to_text(
-        b"short", make_config(chunk_bytes=1024), model, tokenizer
-    )
-    assert key.version == subtext_codec.CODEC_VERSION  # one chunk, uncompressed
-
-
-def test_round_trip_compressed_and_chunked(fake_components):
-    payload = b"the quick brown fox jumps over the lazy dog " * 8
-    decoded = round_trip(payload, fake_components, compress=True, chunk_bytes=16)
-    assert decoded == payload
-
-
-def test_chunked_decoder_ignores_surrounding_noise(fake_components):
-    tokenizer, model = fake_components
-    payload = bytes(range(30))
-    cfg = make_config(chunk_bytes=8)
+    cfg = make_config(max_context_length=32)
     text, key = encode_data_to_text(payload, cfg, model, tokenizer)
 
     decoded = decode_text_to_data(
         "noise. " + text + " trailing!",
-        key=key, prompt_prefix=PROMPT, model=model, tokenizer=tokenizer, device="cpu",
+        key=key, prompt_prefix=PROMPT, model=model, tokenizer=tokenizer,
+        device="cpu", max_context_length=32,
     )
     assert decoded == payload
 
 
-def test_tampering_one_chunk_is_caught(fake_components):
+def test_rolling_tamper_is_caught(fake_components):
     tokenizer, model = fake_components
     payload = bytes(range(40))
-    cfg = make_config(chunk_bytes=8)
+    cfg = make_config(max_context_length=32)
     text, key = encode_data_to_text(payload, cfg, model, tokenizer)
 
-    # Insert text into the first segment's body, shifting its tokens.
     idx = text.find(PROMPT) + len(PROMPT)
     tampered = text[:idx] + "zzz " + text[idx:]
     with pytest.raises(ValueError):
         decode_text_to_data(
             tampered, key=key, prompt_prefix=PROMPT, model=model,
-            tokenizer=tokenizer, device="cpu",
+            tokenizer=tokenizer, device="cpu", max_context_length=32,
         )
+
+
+# Note: whether a *wrong* window is caught can only be exercised on a real
+# model. The fake model's logits depend on the last 8 tokens, and a reset keeps
+# the last 16, so resets are transparent to it and the window does not affect
+# the result. tests/test_real_model.py covers the wrong-window case.
 
 
 # --------------------------------------------------------------------------
@@ -299,7 +317,7 @@ def test_encode_stats_are_reported(fake_components):
     assert isinstance(stats, subtext_codec.EncodeStats)
     assert stats.payload_bytes == len(b"measure me please")
     assert stats.stored_bytes == stats.payload_bytes  # not compressed
-    assert stats.segments == 1
+    assert stats.resets == 0
     assert not stats.compressed
     assert stats.tokens > 0
     assert stats.bits_per_token > 0
@@ -462,14 +480,27 @@ def test_max_new_tokens_is_enforced(fake_components):
         )
 
 
-def test_context_limit_is_enforced(fake_components):
+def test_small_context_rolls_instead_of_failing(fake_components):
+    """A payload that outgrows the context now rolls the window, not errors."""
     tokenizer, model = fake_components
-    with pytest.raises(ValueError, match="context limit"):
+    payload = b"far too long for twelve tokens"
+    text, key = encode_data_to_text(
+        payload, make_config(max_context_length=12), model, tokenizer
+    )
+    assert key.window == 12
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=PROMPT, model=model, tokenizer=tokenizer,
+        device="cpu", max_context_length=12,
+    )
+    assert decoded == payload
+
+
+def test_prompt_longer_than_window_is_rejected(fake_components):
+    tokenizer, model = fake_components
+    with pytest.raises(ValueError, match="context window"):
         encode_data_to_text(
-            b"far too long for twelve tokens",
-            make_config(max_context_length=12),
-            model,
-            tokenizer,
+            b"x", make_config(prompt_prefix="abc uvw", max_context_length=2),
+            model, tokenizer,
         )
 
 
@@ -648,13 +679,18 @@ def test_cli_compress_round_trip(tmp_path, cli_with_fake_model):
     assert key.compression == "zlib"
 
 
-def test_cli_chunk_bytes_round_trip(tmp_path, cli_with_fake_model):
+def test_cli_rolling_round_trip(tmp_path, cli_with_fake_model):
+    """A small context window forces the roll; the key carries the window, so
+    decode needs no extra flag."""
     payload = bytes(range(50))
-    paths = run_cli_round_trip(tmp_path, payload, extra_encode=("--chunk-bytes", "8"))
+    paths = run_cli_round_trip(
+        tmp_path, payload, extra_encode=("--max-context-length", "32")
+    )
     assert paths["output"].read_bytes() == payload
 
     key = subtext_codec.load_codec_key(paths["key"])
     assert key.version == subtext_codec.CODEC_VERSION_V2
+    assert key.window == 32
 
 
 def test_cli_reused_key_keeps_compressing(tmp_path, cli_with_fake_model):

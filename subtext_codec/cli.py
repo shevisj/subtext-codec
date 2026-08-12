@@ -85,13 +85,13 @@ def _stats_reporter(enabled: bool):
         return None
 
     def report(stats: EncodeStats) -> None:
-        seg = "segment" if stats.segments == 1 else "segments"
         line = (
-            f"encoded {stats.payload_bytes} B into {stats.tokens} tokens across "
-            f"{stats.segments} {seg} "
+            f"encoded {stats.payload_bytes} B into {stats.tokens} tokens "
             f"({stats.bits_per_token:.2f} bits/token, "
             f"surprisal {stats.mean_surprisal_bits:.2f})"
         )
+        if stats.resets:
+            line += f"; rolled the context {stats.resets}x"
         if stats.compressed:
             line += f"; compressed {stats.payload_bytes} -> {stats.stored_bytes} B"
         sys.stderr.write(line + "\n")
@@ -182,16 +182,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Uses the v2 wire format."
         ),
     )
-    enc.add_argument(
-        "--chunk-bytes",
-        type=int,
-        default=None,
-        help=(
-            "split payloads larger than this many bytes across re-anchored "
-            "segments, so a message can exceed the model's context window. "
-            "Uses the v2 wire format."
-        ),
-    )
     enc.add_argument("--input-bytes", required=True, help="payload file, or - for stdin")
     enc.add_argument(
         "--output-text", required=True, help="destination for the text, or - for stdout"
@@ -275,7 +265,6 @@ def run_encode(args) -> None:
         store_model_in_key=not args.no_store_model,
         max_new_tokens=args.max_new_tokens,
         compress=compress,
-        chunk_bytes=args.chunk_bytes,
     )
 
     payload = _read_bytes(args.input_bytes)

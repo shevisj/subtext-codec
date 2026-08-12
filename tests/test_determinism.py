@@ -117,6 +117,34 @@ def test_round_trip_on_device(device, dtype):
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_rolling_round_trip_on_device(device, dtype):
+    """A payload that outgrows the window resets its context mid-stream. Encode
+    and decode must reset identically, on every device and dtype."""
+    tokenizer, model = load(device, dtype)
+    cfg = CodecConfig(
+        model_name_or_path=MODEL,
+        device=device,
+        prompt_prefix=PROMPT,
+        top_k=32,
+        temperature=1.5,
+        torch_dtype=dtype,
+        max_context_length=32,  # small, so the payload forces resets
+        store_model_in_key=True,
+    )
+    payload = b"\x00\x00rolling across a reset\xff"
+
+    text, key = encode_data_to_text(payload, cfg, model, tokenizer)
+    assert key.window == 32  # the message rolled and recorded its window
+    decoded = decode_text_to_data(
+        text, key=key, prompt_prefix=PROMPT, model=model,
+        tokenizer=tokenizer, device=device, max_context_length=32,
+    )
+    assert decoded == payload
+
+
+@pytest.mark.slow
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_cached_stepping_matches_a_full_forward(dtype):
     """The KV cache must not change what the model predicts.
