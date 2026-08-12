@@ -1,6 +1,11 @@
 # subtext-codec
 ### Steganographic data encoding in natural language via arithmetic coding against an LLM
 
+[![CI/CD](https://github.com/shevisj/subtext-codec/actions/workflows/ci-cd.yaml/badge.svg)](https://github.com/shevisj/subtext-codec/actions/workflows/ci-cd.yaml)
+[![PyPI version](https://img.shields.io/pypi/v/subtext-codec)](https://pypi.org/project/subtext-codec/)
+[![Python versions](https://img.shields.io/pypi/pyversions/subtext-codec)](https://pypi.org/project/subtext-codec/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **subtext-codec** hides arbitrary binary data inside seemingly normal LLM-generated text. The payload drives an arithmetic coder whose probability model is the language model's own next-token distribution, so the text it produces is distributed exactly as ordinary sampling would be while secretly encoding bytes. With the same model, tokenizer, prompt prefix and parameters, the process is fully reversible.
 
 ---
