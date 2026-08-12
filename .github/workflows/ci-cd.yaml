@@ -21,7 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        # Pinned to a full version: setup-uv stopped publishing floating major
+        # tags in v8, so `@v10` does not resolve.
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           # "auto" caches on normal pushes and PRs but not on tag pushes and
           # other privileged events, which is the cache-poisoning guard added
@@ -57,7 +59,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        # Pinned to a full version: setup-uv stopped publishing floating major
+        # tags in v8, so `@v10` does not resolve.
+        uses: astral-sh/setup-uv@v10.0.0
       - name: Set up Python
         run: uv python install 3.14
       - name: Build
