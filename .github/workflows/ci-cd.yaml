@@ -16,13 +16,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        # Oldest supported (see requires-python) and newest stable.
+        python-version: ["3.10", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10
         with:
-          enable-cache: true
+          # "auto" caches on normal pushes and PRs but not on tag pushes and
+          # other privileged events, which is the cache-poisoning guard added
+          # in setup-uv v10. Do not force this to "true" to shave a minute off
+          # release runs.
+          enable-cache: auto
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
       - name: Install
@@ -50,11 +55,11 @@ jobs:
     permissions:
       id-token: write  # IMPORTANT: this permission is mandatory for trusted publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install 3.14
       - name: Build
         run: uv build
       - name: Publish
